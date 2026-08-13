@@ -1,0 +1,265 @@
+"""Profession map / scenario document operations: items, freeze, restore."""
+
+from __future__ import annotations
+
+import copy
+from datetime import datetime, timezone
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.domain.enums import ArtifactStatus, ChangeType, ItemStatus, StepStatus, StepType
+from app.models import Artifact, ArtifactPatch, PipelineStep
+from app.services.document import apply_patch_json, ensure_ids, find_item, set_item_status
+from app.services.generation import _next_version
+from app.services.pipeline_gate import PipelineGateError
+
+
+class StageEditError(Exception):
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+async def get_current_artifact(
+    db: AsyncSession, project_id: UUID, step_type: str
+) -> Artifact | None:
+    step = await _get_step(db, project_id, step_type)
+    if step and step.current_artifact_id:
+        return await db.get(Artifact, step.current_artifact_id)
+    result = await db.execute(
+        select(Artifact)
+        .where(Artifact.project_id == project_id, Artifact.step_type == step_type)
+        .order_by(Artifact.version.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def patch_item(
+    db: AsyncSession,
+    project_id: UUID,
+    step_type: str,
+    item_id: str,
+    new_item: dict,
+) -> Artifact:
+    artifact = await _editable_artifact(db, project_id, step_type)
+    content = copy.deepcopy(artifact.content) if isinstance(artifact.content, dict) else {}
+    item = find_item(content, item_id)
+    if item is None:
+        raise StageEditError(f"Элемент {item_id} не найден")
+    item.update(new_item)
+    item["id"] = item_id
+    item["status"] = ItemStatus.EDITED.value
+    artifact.content = content
+    artifact.status = ArtifactStatus.EDITED.value
+    await db.flush()
+    await db.refresh(artifact)
+    return artifact
+
+
+async def set_item_decision(
+    db: AsyncSession, project_id: UUID, step_type: str, item_id: str, status: str
+) -> Artifact:
+    artifact = await _editable_artifact(db, project_id, step_type)
+    content = copy.deepcopy(artifact.content) if isinstance(artifact.content, dict) else {}
+    if not set_item_status(content, item_id, status):
+        raise StageEditError(f"Элемент {item_id} не найден")
+    artifact.content = content
+    artifact.status = ArtifactStatus.EDITED.value
+    await db.flush()
+    await db.refresh(artifact)
+    return artifact
+
+
+async def freeze_artifact(
+    db: AsyncSession, artifact: Artifact, summary: str = ""
+) -> Artifact:
+    artifact.frozen = True
+    if summary:
+        artifact.change_summary = summary
+    step = await _get_step(db, artifact.project_id, artifact.step_type)
+    if step:
+        step.approved_artifact_id = artifact.id
+        step.current_artifact_id = artifact.id
+        step.status = StepStatus.LOCKED.value
+    artifact.status = ArtifactStatus.APPROVED.value
+    await db.flush()
+    await db.refresh(artifact)
+    return artifact
+
+
+async def save_version(
+    db: AsyncSession, artifact: Artifact, summary: str = ""
+) -> Artifact:
+    version = await _next_version(db, artifact.project_id, artifact.step_type)
+    snapshot = Artifact(
+        project_id=artifact.project_id,
+        step_type=artifact.step_type,
+        parent_artifact_id=artifact.id,
+        content=copy.deepcopy(artifact.content),
+        format=artifact.format,
+        version=version,
+        status=ArtifactStatus.EDITED.value,
+        change_type=ChangeType.MANUAL.value,
+        change_summary=summary or "Saved version",
+        frozen=False,
+    )
+    db.add(snapshot)
+    await db.flush()
+    step = await _get_step(db, artifact.project_id, artifact.step_type)
+    if step:
+        step.current_artifact_id = snapshot.id
+        if step.status == StepStatus.LOCKED.value:
+            pass
+        else:
+            step.status = StepStatus.UNDER_REVIEW.value
+    await db.refresh(snapshot)
+    return snapshot
+
+
+async def restore_version(
+    db: AsyncSession, current: Artifact, source: Artifact
+) -> Artifact:
+    if source.project_id != current.project_id or source.step_type != current.step_type:
+        raise StageEditError("Версия относится к другому документу")
+    version = await _next_version(db, current.project_id, current.step_type)
+    restored = Artifact(
+        project_id=current.project_id,
+        step_type=current.step_type,
+        parent_artifact_id=source.id,
+        content=copy.deepcopy(source.content),
+        format=source.format,
+        version=version,
+        status=ArtifactStatus.EDITED.value,
+        change_type=ChangeType.RESTORE.value,
+        change_summary=f"Restored from v{source.version}",
+        frozen=False,
+    )
+    db.add(restored)
+    await db.flush()
+    step = await _get_step(db, current.project_id, current.step_type)
+    if step:
+        if step.status == StepStatus.LOCKED.value:
+            raise StageEditError("Шаг зафиксирован. Сначала создайте новую редакцию.")
+        step.current_artifact_id = restored.id
+        step.status = StepStatus.UNDER_REVIEW.value
+    await db.refresh(restored)
+    return restored
+
+
+async def new_map_edition(db: AsyncSession, project_id: UUID) -> dict:
+    """Unlock profession_map and mark scenario_plan as outdated."""
+    map_step = await _get_step(db, project_id, StepType.PROFESSION_MAP.value)
+    if map_step is None:
+        raise StageEditError("Карта профессии не найдена")
+    map_step.status = StepStatus.UNDER_REVIEW.value
+    if map_step.current_artifact_id:
+        art = await db.get(Artifact, map_step.current_artifact_id)
+        if art:
+            art.frozen = False
+
+    scenario = await _get_step(db, project_id, StepType.SCENARIO_PLAN.value)
+    if scenario and scenario.status not in (StepStatus.DRAFT.value,):
+        scenario.status = StepStatus.OUTDATED.value
+
+    await db.flush()
+    return {
+        "profession_map_status": map_step.status,
+        "scenario_plan_status": scenario.status if scenario else None,
+        "warning": "Сценарий помечен как устаревший и потребует пересборки.",
+    }
+
+
+async def apply_patch(
+    db: AsyncSession, patch: ArtifactPatch, user_id: UUID
+) -> Artifact:
+    if patch.status != "draft":
+        raise StageEditError("Патч уже обработан")
+    artifact = await _editable_artifact(db, patch.project_id, patch.stage_type)
+    content = copy.deepcopy(artifact.content) if isinstance(artifact.content, dict) else {}
+    new_content = apply_patch_json(content, patch.patch_json)
+    new_content = ensure_ids(new_content, patch.stage_type)
+
+    version = await _next_version(db, patch.project_id, patch.stage_type)
+    new_art = Artifact(
+        project_id=patch.project_id,
+        step_type=patch.stage_type,
+        parent_artifact_id=artifact.id,
+        content=new_content,
+        format="json",
+        version=version,
+        status=ArtifactStatus.EDITED.value,
+        change_type=ChangeType.AI_PATCH.value,
+        change_summary=(patch.instruction or "AI patch")[:500],
+        frozen=False,
+    )
+    db.add(new_art)
+    await db.flush()
+    patch.status = "applied"
+    patch.artifact_id = new_art.id
+    step = await _get_step(db, patch.project_id, patch.stage_type)
+    if step:
+        step.current_artifact_id = new_art.id
+        step.status = StepStatus.UNDER_REVIEW.value
+    await _append_decision(
+        db, patch.project_id, patch.stage_type, patch.instruction, user_id
+    )
+    await db.refresh(new_art)
+    return new_art
+
+
+async def discard_patch(db: AsyncSession, patch: ArtifactPatch) -> ArtifactPatch:
+    if patch.status != "draft":
+        raise StageEditError("Патч уже обработан")
+    patch.status = "discarded"
+    await db.flush()
+    return patch
+
+
+async def _editable_artifact(
+    db: AsyncSession, project_id: UUID, step_type: str
+) -> Artifact:
+    step = await _get_step(db, project_id, step_type)
+    if step and step.status == StepStatus.LOCKED.value:
+        raise StageEditError("Шаг зафиксирован. Чтобы изменить его, создайте новую редакцию.")
+    artifact = await get_current_artifact(db, project_id, step_type)
+    if artifact is None:
+        raise StageEditError("Нет текущего документа")
+    if artifact.frozen:
+        raise StageEditError("Версия зафиксирована")
+    return artifact
+
+
+async def _get_step(
+    db: AsyncSession, project_id: UUID, step_type: str
+) -> PipelineStep | None:
+    result = await db.execute(
+        select(PipelineStep).where(
+            PipelineStep.project_id == project_id, PipelineStep.step_type == step_type
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def _append_decision(
+    db: AsyncSession, project_id: UUID, stage_type: str, text: str, user_id: UUID
+) -> None:
+    from app.models import StageChatSession
+
+    result = await db.execute(
+        select(StageChatSession).where(
+            StageChatSession.project_id == project_id,
+            StageChatSession.stage_type == stage_type,
+        )
+    )
+    sessions = result.scalars().all()
+    for session in sessions:
+        summary = dict(session.summary_json or {})
+        decisions = list(summary.get("accepted_decisions") or [])
+        decisions.append({"text": text, "at": datetime.now(timezone.utc).isoformat()})
+        summary["accepted_decisions"] = decisions[-30:]
+        session.summary_json = summary
+    _ = user_id
+    _ = PipelineGateError

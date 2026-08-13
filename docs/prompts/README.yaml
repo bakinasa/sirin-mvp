@@ -1,0 +1,7 @@
+# System and operator prompt overlays (optional YAML)
+# Seeded defaults live in apps/api/app/seed.py; this folder is for versioned docs.
+
+version: "1"
+notes: >
+  Production prompting: short role, goal, constraints, output format,
+  quality criteria, and clarifications_needed — no persona fluff.

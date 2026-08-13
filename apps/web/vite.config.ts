@@ -6,6 +6,6 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
-    allowedHosts: ["aisudio-sirin.markovav.ru"],
+    allowedHosts: ["aistudio-sirin.markovav.ru"],
   },
 });

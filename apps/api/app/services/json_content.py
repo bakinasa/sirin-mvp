@@ -25,24 +25,18 @@ def parse_llm_json_content(text: str) -> Any:
     add(_extract_from_markdown_fences(text))
     add(_extract_balanced_object(text))
 
+    repaired = _repair_truncated_json(_extract_balanced_object(text) or text)
+    if repaired:
+        add(repaired)
+
     for candidate in candidates:
         parsed = _try_parse(candidate)
         if parsed is None:
             continue
         unwrapped = unwrap_block_document(parsed)
-        if isinstance(unwrapped, dict) and isinstance(unwrapped.get("sections"), list):
-            if unwrapped["sections"]:
-                return unwrapped
+        if isinstance(unwrapped, dict) and unwrapped.get("sections"):
+            return unwrapped
 
-    repaired = _repair_truncated_json(_extract_balanced_object(text) or text)
-    if repaired:
-        parsed = _try_parse(repaired)
-        if parsed is not None:
-            unwrapped = unwrap_block_document(parsed)
-            if isinstance(unwrapped, dict) and unwrapped.get("sections"):
-                return unwrapped
-
-    # Last resort: first valid JSON object even without sections (chat / other steps).
     for candidate in candidates:
         parsed = _try_parse(candidate)
         if parsed is not None:
@@ -72,6 +66,80 @@ def unwrap_block_document(parsed: Any) -> Any:
                 return inner
 
     return parsed
+
+
+_SUMMARY_KEYS = (
+    "brief_points",
+    "operations",
+    "skills",
+    "violations",
+    "visual_points",
+    "constraints",
+    "terms",
+    "important_fragments",
+    "short",
+)
+
+
+def extract_source_summary(payload: Any) -> dict[str, Any]:
+    """Normalize a source-summary JSON payload into the stored field shape."""
+    data = _unwrap_summary_dict(payload)
+    brief = _as_list(data.get("brief_points") if data else None) or _as_list(
+        data.get("short") if data else None
+    )
+    return {
+        "brief_points": brief,
+        "operations": _as_list(data.get("operations") if data else None),
+        "skills": _as_list(data.get("skills") if data else None),
+        "violations": _as_list(data.get("violations") if data else None),
+        "visual_points": _as_list(data.get("visual_points") if data else None),
+        "constraints": _as_list(data.get("constraints") if data else None),
+        "terms": _as_list(data.get("terms") if data else None),
+        "important_fragments": _as_list(data.get("important_fragments") if data else None),
+    }
+
+
+def summary_has_content(summary: dict[str, Any]) -> bool:
+    return any(summary.get(key) for key in _SUMMARY_KEYS if key != "short")
+
+
+def _unwrap_summary_dict(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, str):
+        payload = parse_llm_json_content(payload)
+    if not isinstance(payload, dict):
+        return {}
+    if any(k in payload for k in _SUMMARY_KEYS):
+        return payload
+    for key in ("raw_text", "raw"):
+        raw = payload.get(key)
+        if isinstance(raw, str) and raw.strip():
+            inner = parse_llm_json_content(raw)
+            if isinstance(inner, dict) and any(k in inner for k in _SUMMARY_KEYS):
+                return inner
+            continue
+    for key in ("content", "body", "data", "result", "document", "output", "summary"):
+        val = payload.get(key)
+        if isinstance(val, dict):
+            found = _unwrap_summary_dict(val)
+            if found:
+                return found
+        if isinstance(val, str) and val.strip() and any(k in val for k in _SUMMARY_KEYS):
+            inner = parse_llm_json_content(val)
+            if isinstance(inner, dict) and any(k in inner for k in _SUMMARY_KEYS):
+                return inner
+    return payload
+
+
+def _as_list(value: Any) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    if isinstance(value, dict):
+        return [value]
+    return [value]
 
 
 def recover_sections_from_payload(content: dict[str, Any]) -> dict[str, Any] | None:

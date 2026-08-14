@@ -11,6 +11,7 @@ from app.models import ProjectSource, User
 from app.schemas import SourceDetailOut, SourceOut, SourceReprocessIn
 from app.services.sources import (
     create_source_from_upload,
+    delete_source,
     list_sources,
     process_source,
     source_to_out,
@@ -93,12 +94,19 @@ async def reprocess(
     source = result.scalar_one_or_none()
     if source is None:
         raise HTTPException(404, "Source not found")
-    source = await process_source(
-        db,
-        source,
-        user_id=user.id,
-        raw=None,
-        primary_model_id=body.primary_model_id if body else None,
-        fallback_model_id=body.fallback_model_id if body else None,
-    )
     return SourceOut.model_validate(source_to_out(source))
+
+
+@router.delete("/sources/{source_id}", status_code=204)
+async def remove_source(
+    source_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _ = user
+    result = await db.execute(select(ProjectSource).where(ProjectSource.id == source_id))
+    source = result.scalar_one_or_none()
+    if source is None:
+        raise HTTPException(404, "Source not found")
+    await delete_source(db, source)
+    return None

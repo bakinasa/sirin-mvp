@@ -51,6 +51,8 @@ export function ModelsPage() {
   const [testByModelId, setTestByModelId] = useState<
     Record<string, { ok: boolean; hint: string; provider: string }>
   >({});
+  const [keyEditId, setKeyEditId] = useState("");
+  const [keyDraft, setKeyDraft] = useState("");
 
   const [form, setForm] = useState({
     provider_type: "openai_compatible",
@@ -313,6 +315,47 @@ export function ModelsPage() {
     }
   }
 
+  async function deleteUserModel(userModelId: string, label: string) {
+    if (!confirm(`Удалить модель «${label}» из списка?`)) return;
+    setBusyId(userModelId);
+    try {
+      await api(`/user-models/${userModelId}`, { method: "DELETE" });
+      setModels((prev) => prev.filter((m) => m.id !== userModelId));
+      setTestByModelId((prev) => {
+        const next = { ...prev };
+        delete next[userModelId];
+        return next;
+      });
+      setSyncMsg("Модель удалена из списка.");
+    } catch (err) {
+      setSyncMsg(`Не удалось удалить: ${String(err)}`);
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function saveModelKey(userModelId: string) {
+    if (!keyDraft.trim()) {
+      setSyncMsg("Введите API-ключ.");
+      return;
+    }
+    setBusyId(userModelId);
+    try {
+      await api(`/user-models/${userModelId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ api_key: keyDraft.trim() }),
+      });
+      setKeyEditId("");
+      setKeyDraft("");
+      setSyncMsg("Ключ обновлён. Нажмите «Проверить».");
+      await testUserModel(userModelId);
+    } catch (err) {
+      setSyncMsg(`Не удалось обновить ключ: ${String(err)}`);
+    } finally {
+      setBusyId("");
+    }
+  }
+
   // New UX: user-owned models list + add form (BYOK per model connection).
   // The legacy UI below remains in the file but is unreachable.
   if (true) {
@@ -358,10 +401,61 @@ export function ModelsPage() {
                             disabled={busyId === m.id}
                             onClick={() => testUserModel(m.id)}
                           >
-                            {busyId === m.id ? "Testing…" : "Test"}
+                            {busyId === m.id ? "Проверка…" : "Проверить"}
+                          </button>
+                          <button
+                            className="btn-ghost"
+                            disabled={busyId === m.id}
+                            onClick={() => {
+                              setKeyEditId(m.id);
+                              setKeyDraft("");
+                            }}
+                          >
+                            Обновить ключ
+                          </button>
+                          <button
+                            className="btn-danger"
+                            disabled={busyId === m.id}
+                            onClick={() =>
+                              void deleteUserModel(
+                                m.id,
+                                (m.provider_name ? `${m.provider_name}: ` : "") + m.label
+                              )
+                            }
+                          >
+                            Удалить
                           </button>
                         </div>
                       </div>
+                      {keyEditId === m.id && (
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          <input
+                            className="input flex-1"
+                            type="password"
+                            placeholder="Новый API-ключ"
+                            value={keyDraft}
+                            onChange={(e) => setKeyDraft(e.target.value)}
+                          />
+                          <button
+                            type="button"
+                            className="btn-primary"
+                            disabled={busyId === m.id}
+                            onClick={() => void saveModelKey(m.id)}
+                          >
+                            Сохранить ключ
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-ghost"
+                            onClick={() => {
+                              setKeyEditId("");
+                              setKeyDraft("");
+                            }}
+                          >
+                            Отмена
+                          </button>
+                        </div>
+                      )}
                       {tr ? (
                         <p
                           className={`mt-2 text-sm ${

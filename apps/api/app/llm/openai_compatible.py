@@ -100,10 +100,13 @@ class OpenAICompatibleProvider:
         url = f"{self.base_url}/models"
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.get(url, headers=self._headers(api_key))
-            # Some providers return 404 for /models but accept chat; treat 401/403 as bad.
-            if resp.status_code in (401, 403):
+            # 401 = ключ точно отвергнут.
+            # 403 на /models часто бывает у Groq/OpenRouter при рабочем chat — не считаем фатальным.
+            if resp.status_code == 401:
                 return False
-            return True
+            if resp.status_code == 403:
+                return True
+            return resp.status_code < 500
 
     async def generate(self, api_key: str, request: GenerateRequest) -> GenerateResult:
         url = f"{self.base_url}/chat/completions"

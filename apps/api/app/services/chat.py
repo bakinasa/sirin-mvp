@@ -105,11 +105,29 @@ async def chat(
         if mode == ChatMode.ASK.value:
             parsed = _parse_json_content(result.content)
             if isinstance(parsed, dict) and parsed.get("answer"):
-                reply_text = str(parsed["answer"])
+                reply_text = str(parsed["answer"]).strip()
+                sources = parsed.get("sources_used") or []
+                opens = parsed.get("open_questions") or []
+                extras: list[str] = []
+                if isinstance(sources, list) and sources:
+                    extras.append(
+                        "Источники: " + "; ".join(str(s) for s in sources if s)
+                    )
+                if isinstance(opens, list) and opens:
+                    extras.append(
+                        "Открытые вопросы: " + "; ".join(str(s) for s in opens if s)
+                    )
+                if extras:
+                    reply_text = reply_text + "\n\n" + "\n".join(extras)
             elif isinstance(parsed, dict) and parsed.get("raw_text"):
                 reply_text = str(parsed["raw_text"])
             else:
                 reply_text = result.content or ""
+            if not reply_text.strip():
+                reply_text = (
+                    "Модель вернула пустой ответ. Попробуйте переформулировать вопрос "
+                    "или сменить модель."
+                )
         else:
             parsed = _parse_json_content(result.content)
             if not isinstance(parsed, dict):

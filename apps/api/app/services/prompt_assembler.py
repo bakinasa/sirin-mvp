@@ -77,13 +77,39 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "sections": {
                 "type": "array",
+                "minItems": 8,
                 "items": {
                     "type": "object",
                     "required": ["id", "title", "items"],
                     "properties": {
-                        "id": {"type": "string"},
+                        "id": {
+                            "type": "string",
+                            "description": "Один из: work_type, skills, assessment_points, errors, segment_ideas, contradictions, expert_questions, shooting_constraints",
+                        },
                         "title": {"type": "string"},
-                        "items": {"type": "array", "items": {"type": "object"}},
+                        "items": {
+                            "type": "array",
+                            "minItems": 2,
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "title", "description"],
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "description": {
+                                        "type": "string",
+                                        "description": "Развёрнутое описание 2–5 предложений",
+                                    },
+                                    "why_it_matters": {"type": "string"},
+                                    "observable_cues": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "source_hint": {"type": "string"},
+                                    "status": {"type": "string"},
+                                },
+                            },
+                        },
                     },
                 },
             }
@@ -95,13 +121,41 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {
             "sections": {
                 "type": "array",
+                "minItems": 8,
                 "items": {
                     "type": "object",
                     "required": ["id", "title", "items"],
                     "properties": {
-                        "id": {"type": "string"},
+                        "id": {
+                            "type": "string",
+                            "description": "Один из: passport, training_mode, diagnostic_mode, violation_categories, regulations, props, shooting_notes, constraints",
+                        },
                         "title": {"type": "string"},
-                        "items": {"type": "array", "items": {"type": "object"}},
+                        "items": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "required": ["id", "title", "description"],
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "description": {
+                                        "type": "string",
+                                        "description": "Подробное описание сцены/пункта",
+                                    },
+                                    "learning_goal": {"type": "string"},
+                                    "assessment_points": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "props": {"type": "array", "items": {"type": "string"}},
+                                    "shooting_notes": {"type": "string"},
+                                    "frames": {"type": "array", "items": {"type": "object"}},
+                                    "status": {"type": "string"},
+                                },
+                            },
+                        },
                     },
                 },
             }
@@ -117,9 +171,17 @@ LOCAL_PATCH_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["target_id", "old", "new", "rationale"],
+                "required": ["target_id", "rationale"],
                 "properties": {
-                    "target_id": {"type": "string"},
+                    "target_id": {
+                        "type": "string",
+                        "description": "id карточки или id раздела (например expert_questions)",
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["replace", "add_item", "add_items"],
+                        "description": "replace — заменить цель; add_item/add_items — добавить в раздел",
+                    },
                     "old": {},
                     "new": {},
                     "rationale": {"type": "string"},
@@ -260,19 +322,24 @@ async def assemble_chat_prompt(
         "ask": (
             "Ты отвечаешь на вопрос пользователя по проекту.\n"
             "Важно: не меняй документ; не предлагай автоматически перезапись; "
-            "отвечай только на основе brief, выжимок файлов, принятых решений и текущего артефакта; "
+            "отвечай развёрнуто (несколько абзацев), с конкретикой из brief, выжимок и артефакта; "
             "если данных недостаточно, прямо скажи об этом; "
-            "если возможно, укажи, на каком источнике основан ответ."
+            "если возможно, укажи источник. Не отвечай одной короткой фразой."
         ),
         "local_edit": (
-            "Ты вносишь только локальное изменение в указанный блок документа.\n"
-            "Меняй только указанный блок; не переписывай другие разделы; "
-            "сохраняй стиль и структуру; верни JSON patch: changes[].target_id, old, new, rationale."
+            "Ты вносишь локальное изменение в указанную цель документа.\n"
+            "Цель может быть карточкой (item) или целым разделом (section id, например expert_questions).\n"
+            "Если цель — раздел: меняй/добавляй только пункты этого раздела; не переноси в другие секции "
+            "(skills ≠ expert_questions).\n"
+            "Чтобы добавить пункт в раздел, используй action=add_item и new={id,title,description,...}.\n"
+            "Не переписывай другие разделы. Сохраняй стиль. "
+            "Верни JSON patch: changes[].target_id, action?, old?, new, rationale."
         ),
         "global_edit": (
             "Ты вносишь глобальное изменение во весь документ.\n"
             "Примени правило ко всем соответствующим разделам; "
             "сохраняй существующие ручные правки, если они не противоречат инструкции; "
+            "каждый пункт делай содержательным (title + description); "
             "верни JSON: summary + changes[] с target_id и new."
         ),
     }
@@ -293,13 +360,29 @@ async def assemble_chat_prompt(
     if mode == "ask":
         user_message = (
             f"{context_text}\n\n=== USER QUESTION ===\n{user_text}\n\n"
-            'Верни JSON вида {"answer": "текст ответа"} без изменения документа.'
+            'Верни JSON вида {"answer": "развёрнутый ответ на русском, минимум 4–8 предложений, '
+            'с опорой на источники и артефакт"}. Документ не меняй.'
         )
-        schema = {"type": "object", "required": ["answer"], "properties": {"answer": {"type": "string"}}}
+        schema = {
+            "type": "object",
+            "required": ["answer"],
+            "properties": {
+                "answer": {"type": "string"},
+                "sources_used": {"type": "array", "items": {"type": "string"}},
+                "open_questions": {"type": "array", "items": {"type": "string"}},
+            },
+        }
     else:
         schema = LOCAL_PATCH_SCHEMA if mode == "local_edit" else GLOBAL_PATCH_SCHEMA
+        target_note = (
+            f"\nЦелевой id: {target_id}. "
+            "Если это id раздела — правь только его. Не переноси содержимое в другой раздел.\n"
+            if target_id
+            else "\nЦель не указана — уточни в rationale и не выдумывай чужой раздел.\n"
+        )
         user_message = (
-            f"{context_text}\n\n=== USER INSTRUCTION ===\n{user_text}\n\n"
+            f"{context_text}\n\n=== USER INSTRUCTION ===\n{user_text}\n"
+            f"{target_note}"
             f"=== OUTPUT SCHEMA (JSON) ===\n{schema}\n"
             "Верни ТОЛЬКО валидный JSON."
         )

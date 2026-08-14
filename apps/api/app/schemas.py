@@ -346,6 +346,12 @@ class UserModelCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class UserModelKeyUpdate(BaseModel):
+    """Re-enter BYOK for an existing model connection without recreating it."""
+
+    api_key: str
+
+
 class UserModelOut(BaseModel):
     id: UUID
     owner_id: UUID
@@ -555,6 +561,17 @@ class CommentThreadOut(BaseModel):
 
 class ItemPatchIn(BaseModel):
     content: dict[str, Any]
+
+
+class SectionItemCreateIn(BaseModel):
+    title: str
+    description: str = ""
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class SectionItemCreateOut(BaseModel):
+    artifact: ArtifactOut
+    item: dict[str, Any]
 
 
 class GenerateStageIn(BaseModel):

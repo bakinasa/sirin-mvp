@@ -11,7 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.enums import ArtifactStatus, ChangeType, ItemStatus, StepStatus, StepType
 from app.models import Artifact, ArtifactPatch, PipelineStep
-from app.services.document import apply_patch_json, ensure_ids, find_item, set_item_status
+from app.services.document import (
+    append_section_items,
+    apply_patch_json,
+    ensure_ids,
+    find_item,
+    item_field_template,
+    set_item_status,
+)
 from app.services.generation import _next_version
 from app.services.pipeline_gate import PipelineGateError
 
@@ -35,6 +42,54 @@ async def get_current_artifact(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def add_section_item(
+    db: AsyncSession,
+    project_id: UUID,
+    step_type: str,
+    section_id: str,
+    *,
+    title: str,
+    description: str = "",
+    extra: dict | None = None,
+) -> tuple[Artifact, dict]:
+    artifact = await _editable_artifact(db, project_id, step_type)
+    content = copy.deepcopy(artifact.content) if isinstance(artifact.content, dict) else {}
+    section = next(
+        (s for s in (content.get("sections") or []) if isinstance(s, dict) and s.get("id") == section_id),
+        None,
+    )
+    if section is None:
+        raise StageEditError(f"Раздел {section_id} не найден")
+
+    items = section.get("items") or []
+    if not isinstance(items, list):
+        items = []
+    new_item = item_field_template(items)
+    new_item["title"] = title.strip()
+    new_item["description"] = description.strip()
+    if extra:
+        new_item.update(extra)
+
+    created_ids = append_section_items(
+        content,
+        section_id,
+        [new_item],
+        default_status=ItemStatus.EDITED.value,
+    )
+    if not created_ids:
+        raise StageEditError(f"Не удалось добавить пункт в раздел {section_id}")
+
+    artifact.content = content
+    artifact.status = ArtifactStatus.EDITED.value
+    await db.flush()
+    await db.refresh(artifact)
+
+    saved = find_item(content, created_ids[0])
+    if saved is None:
+        raise StageEditError("Пункт создан, но не найден в документе")
+    return artifact, saved
 
 
 async def patch_item(

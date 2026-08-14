@@ -21,6 +21,7 @@ from app.schemas import (
     StepModelConfigIn,
     StepModelConfigOut,
     UserModelCreate,
+    UserModelKeyUpdate,
     UserModelOut,
     UserModelTestOut,
 )
@@ -230,10 +231,46 @@ async def create_user_model(
         for k, v in data.items():
             setattr(existing, k, v)
         existing.encrypted_api_key = encrypt_secret(body.api_key)
+        existing.is_enabled = True
 
     await db.flush()
     await db.refresh(existing)
     return existing
+
+
+@router.delete("/user-models/{user_model_id}", status_code=204)
+async def delete_user_model(
+    user_model_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Soft-delete: hide from lists; keep row so StepModelConfig FKs stay valid."""
+    model = await db.get(UserModel, user_model_id)
+    if model is None or model.owner_id != user.id:
+        raise HTTPException(404, "User model not found")
+    model.is_enabled = False
+    await db.flush()
+    return None
+
+
+@router.patch("/user-models/{user_model_id}", response_model=UserModelOut)
+async def update_user_model_key(
+    user_model_id: UUID,
+    body: UserModelKeyUpdate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    model = await db.get(UserModel, user_model_id)
+    if model is None or model.owner_id != user.id:
+        raise HTTPException(404, "User model not found")
+    key = (body.api_key or "").strip()
+    if not key:
+        raise HTTPException(400, "api_key is required")
+    model.encrypted_api_key = encrypt_secret(key)
+    model.is_enabled = True
+    await db.flush()
+    await db.refresh(model)
+    return model
 
 
 @router.post("/user-models/{user_model_id}/test", response_model=UserModelTestOut)
@@ -248,19 +285,20 @@ async def test_user_model(
 
     try:
         api_key = decrypt_secret(model.encrypted_api_key)
-        adapter = build_provider(
-            model.provider_type, model.provider_name, model.base_url, model.capabilities_json
-        )
-        ok = await adapter.validate_credentials(api_key)
-        if not ok:
+        if not api_key.strip():
             return {
                 "ok": False,
                 "provider": model.provider_name,
-                "hint": "Ключ не принят или недоступны модели. Проверьте base_url/provider_type и BYOK.",
+                "hint": "Ключ пустой. Добавьте модель заново с API-ключом.",
                 "synced_models_count": None,
             }
 
-        # Minimal real request: tiny max_tokens to reduce chance of large cost.
+        adapter = build_provider(
+            model.provider_type, model.provider_name, model.base_url, model.capabilities_json
+        )
+
+        # Главная проверка — реальный chat/completions.
+        # GET /models у Groq/OpenRouter часто даёт 403 даже при рабочем ключе.
         req = GenerateRequest(
             model=model.model_id,
             system="You are a helpful assistant.",
@@ -276,6 +314,13 @@ async def test_user_model(
             "ok": True,
             "provider": model.provider_name,
             "hint": "OK. Ключ рабочий и запрос к модели проходит.",
+            "synced_models_count": None,
+        }
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "provider": model.provider_name,
+            "hint": str(exc),
             "synced_models_count": None,
         }
     except Exception as exc:  # noqa: BLE001

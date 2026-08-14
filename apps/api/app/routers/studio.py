@@ -19,6 +19,8 @@ from app.schemas import (
     GenerateStageIn,
     ItemPatchIn,
     PatchOut,
+    SectionItemCreateIn,
+    SectionItemCreateOut,
     PipelineRunOut,
     SaveVersionIn,
 )
@@ -33,6 +35,7 @@ from app.services.stages import (
     freeze_artifact,
     get_current_artifact,
     new_map_edition,
+    add_section_item,
     patch_item,
     restore_version,
     save_version,
@@ -79,6 +82,33 @@ async def generate_profession_map(
         )
     except Exception as exc:  # noqa: BLE001
         raise _http(exc) from exc
+
+
+@router.post(
+    "/projects/{project_id}/profession-map/sections/{section_id}/items",
+    response_model=SectionItemCreateOut,
+)
+async def create_map_section_item(
+    project_id: UUID,
+    section_id: str,
+    body: SectionItemCreateIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _ = user
+    try:
+        artifact, item = await add_section_item(
+            db,
+            project_id,
+            StepType.PROFESSION_MAP.value,
+            section_id,
+            title=body.title,
+            description=body.description,
+            extra=body.extra or None,
+        )
+        return SectionItemCreateOut(artifact=artifact, item=item)
+    except StageEditError as exc:
+        raise HTTPException(400, exc.message) from exc
 
 
 @router.patch("/projects/{project_id}/profession-map/items/{item_id}", response_model=ArtifactOut)
@@ -187,6 +217,33 @@ async def generate_scenario(
         )
     except Exception as exc:  # noqa: BLE001
         raise _http(exc) from exc
+
+
+@router.post(
+    "/projects/{project_id}/scenario/sections/{section_id}/items",
+    response_model=SectionItemCreateOut,
+)
+async def create_scenario_section_item(
+    project_id: UUID,
+    section_id: str,
+    body: SectionItemCreateIn,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _ = user
+    try:
+        artifact, item = await add_section_item(
+            db,
+            project_id,
+            StepType.SCENARIO_PLAN.value,
+            section_id,
+            title=body.title,
+            description=body.description,
+            extra=body.extra or None,
+        )
+        return SectionItemCreateOut(artifact=artifact, item=item)
+    except StageEditError as exc:
+        raise HTTPException(400, exc.message) from exc
 
 
 @router.patch("/projects/{project_id}/scenario/items/{item_id}", response_model=ArtifactOut)

@@ -191,13 +191,88 @@ def apply_patch_json(content: dict[str, Any], patch_json: Any) -> dict[str, Any]
         if not isinstance(change, dict):
             continue
         target = change.get("target_id") or change.get("id") or ""
-        new_val = change.get("new") if "new" in change else change.get("new_value")
         if not target:
+            continue
+        action = str(change.get("action") or "replace")
+        new_val = change.get("new") if "new" in change else change.get("new_value")
+
+        if action in ("add_item", "append_item") and isinstance(new_val, dict):
+            _append_items(doc, target, [new_val])
+            continue
+        if action in ("add_items", "append_items") and isinstance(new_val, list):
+            _append_items(doc, target, [x for x in new_val if isinstance(x, dict)])
             continue
         if new_val is None:
             continue
         replace_item(doc, target, new_val)
     return doc
+
+
+def append_section_items(
+    content: dict[str, Any],
+    section_id: str,
+    new_items: list[dict[str, Any]],
+    *,
+    default_status: str = ItemStatus.PROPOSED.value,
+) -> list[str]:
+    """Append items into a top-level section. Returns ids of created items."""
+    created: list[str] = []
+    for section in content.get("sections") or []:
+        if section.get("id") != section_id:
+            continue
+        items = section.setdefault("items", [])
+        if not isinstance(items, list):
+            section["items"] = []
+            items = section["items"]
+        for it in new_items:
+            item = dict(it)
+            item.setdefault("id", f"{section_id}-{uuid.uuid4().hex[:8]}")
+            item.setdefault("status", default_status)
+            items.append(item)
+            created.append(str(item["id"]))
+        return created
+    return created
+
+
+def item_field_template(section_items: list[Any]) -> dict[str, Any]:
+    """Empty field shell matching the first sibling item in a section."""
+    skip = {"id", "status", "items", "frames", "segments"}
+    template: dict[str, Any] = {"title": "", "description": ""}
+    for item in section_items:
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            if key in skip:
+                continue
+            if isinstance(value, str) or value is None:
+                template.setdefault(key, "")
+            elif isinstance(value, (int, float)):
+                template.setdefault(key, value)
+        break
+    return template
+
+
+def _append_items(content: dict[str, Any], section_or_item_id: str, new_items: list[dict[str, Any]]) -> bool:
+    """Append items into a section (or nested items list)."""
+    for section in content.get("sections") or []:
+        if section.get("id") == section_or_item_id:
+            append_section_items(content, section_or_item_id, new_items)
+            return True
+        items = section.get("items") or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") == section_or_item_id:
+                nested = item.setdefault("items", [])
+                if not isinstance(nested, list):
+                    item["items"] = []
+                    nested = item["items"]
+                for it in new_items:
+                    it = dict(it)
+                    it.setdefault("id", f"{section_or_item_id}-{uuid.uuid4().hex[:8]}")
+                    nested.append(it)
+                return True
+    return False
 
 
 def document_outline(content: dict[str, Any]) -> list[dict[str, Any]]:

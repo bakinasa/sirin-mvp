@@ -63,7 +63,18 @@ async def update_template(
     tpl = await db.get(PromptTemplate, template_id)
     if tpl is None:
         raise HTTPException(404, "Template not found")
-    for k, v in body.model_dump(exclude_unset=True).items():
+    data = body.model_dump(exclude_unset=True)
+    if data.get("is_active") is True:
+        result = await db.execute(
+            select(PromptTemplate).where(
+                PromptTemplate.step_type == tpl.step_type,
+                PromptTemplate.is_active.is_(True),
+                PromptTemplate.id != tpl.id,
+            )
+        )
+        for other in result.scalars().all():
+            other.is_active = False
+    for k, v in data.items():
         setattr(tpl, k, v)
     await db.flush()
     await db.refresh(tpl)

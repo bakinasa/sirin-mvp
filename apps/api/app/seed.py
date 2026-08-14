@@ -87,12 +87,14 @@ SYSTEM_TEMPLATES = [
     {
         "step_type": "source_summary",
         "role_name": "source_analyst",
-        "version": "1",
+        "version": "2",
         "content": (
             "Ты анализируешь документ по профессии, операции или нормативным требованиям.\n"
             "Верни структурированный JSON. Используй только информацию из документа. "
             "Не придумывай факты. Если фрагмент неясен, пометь unclear. "
-            "Выделяй только то, что полезно для диагностики навыков и сценария.\n"
+            "Пиши подробно: brief_points — 7–12 содержательных пунктов (не односложные); "
+            "в operations/skills/violations/visual_points/constraints/terms — полные формулировки, "
+            "а не короткие ярлыки; important_fragments — короткие цитаты.\n"
             "Поля: brief_points, operations, skills, violations, visual_points, "
             "constraints, terms, important_fragments."
         ),
@@ -100,59 +102,67 @@ SYSTEM_TEMPLATES = [
     {
         "step_type": "profession_map",
         "role_name": "profession_analyst",
-        "version": "1",
+        "version": "2",
         "content": (
             "Ты формируешь карту профессии и основу диагностического модуля.\n"
             "Вход: краткий brief, выжимки файлов, заметки, принятые решения.\n"
             "Сформируй секции: work_type, skills, assessment_points, errors, "
             "segment_ideas, contradictions, expert_questions, shooting_constraints.\n"
-            "Правила: не выдумывай факты; каждое важное утверждение по возможности "
-            "привязывай к источнику; если данных не хватает — формулируй вопрос.\n"
-            "Формат: JSON {sections:[{id,title,items:[{id,title,...}]}]}."
+            "В каждой секции минимум 3–5 пунктов. У каждого пункта обязательны "
+            "id, title, description (2–5 предложений), по возможности why_it_matters, "
+            "observable_cues[], source_hint.\n"
+            "Правила: не выдумывай факты; не путай секции "
+            "(вопрос эксперту — только в expert_questions, навык — только в skills); "
+            "если данных не хватает — формулируй вопрос в contradictions или expert_questions.\n"
+            "Формат: JSON {sections:[{id,title,items:[...]}]}."
         ),
     },
     {
         "step_type": "scenario_plan",
         "role_name": "scenario_director",
-        "version": "1",
+        "version": "2",
         "content": (
             "Ты создаешь единый документ «Сценарий и съёмочный план» для иммерсивного модуля.\n"
             "Секции: passport, training_mode, diagnostic_mode, violation_categories, "
             "regulations, props, shooting_notes, constraints.\n"
             "Режим Обучение показывает правильное выполнение. "
             "Режим Диагностика показывает нарушения. В сегменте желательно 2–3 точки оценки.\n"
+            "Каждый пункт: id, title, description (подробно), learning_goal, assessment_points[], "
+            "props[], shooting_notes по возможности. Не оставляй пустые description.\n"
             "Аудиотекст не обязателен. Формат: JSON sections[]."
         ),
     },
     {
         "step_type": "chat_ask",
         "role_name": "project_assistant",
-        "version": "1",
+        "version": "2",
         "content": (
             "Ты отвечаешь на вопрос пользователя по проекту.\n"
-            "Не меняй документ. Не предлагай автоматически перезапись. "
-            "Отвечай только на основе brief, выжимок файлов, принятых решений и текущего артефакта. "
-            "Если данных недостаточно, скажи об этом. Укажи источник, если возможно."
+            "Не меняй документ. Отвечай развёрнуто на русском: несколько абзацев, "
+            "с опорой на brief, выжимки файлов, принятые решения и текущий артефакт. "
+            "Укажи источник, если возможно. Если данных мало — скажи об этом и перечисли, чего не хватает."
         ),
     },
     {
         "step_type": "chat_local_edit",
         "role_name": "block_editor",
-        "version": "1",
+        "version": "2",
         "content": (
-            "Ты вносишь только локальное изменение в указанный блок документа.\n"
-            "Не переписывай другие разделы. Сохраняй стиль и структуру. "
-            "Верни JSON patch: {changes:[{target_id, old, new, rationale}]}."
+            "Ты вносишь локальное изменение в указанную цель: карточку или раздел.\n"
+            "Если target_id — раздел (например expert_questions), добавляй/правь только его пункты. "
+            "Не переноси «вопрос» в skills и наоборот.\n"
+            "Для нового пункта в разделе: action=add_item, new={id,title,description,...}.\n"
+            "Сохраняй стиль. Верни JSON patch: {changes:[{target_id, action?, old?, new, rationale}]}."
         ),
     },
     {
         "step_type": "chat_global_edit",
         "role_name": "document_editor",
-        "version": "1",
+        "version": "2",
         "content": (
             "Ты вносишь глобальное изменение во весь документ.\n"
             "Сохраняй ручные правки, если они не противоречат инструкции. "
-            "Не удаляй информацию без причины. "
+            "Не удаляй информацию без причины. Пункты делай содержательными (title + description).\n"
             "Верни JSON: {summary, changes:[{target_id, old, new, rationale}]}."
         ),
     },
@@ -289,6 +299,15 @@ async def seed() -> None:
                 )
             )
             if exists.scalar_one_or_none() is None:
+                if tpl.get("is_active", True):
+                    old = await db.execute(
+                        select(PromptTemplate).where(
+                            PromptTemplate.step_type == tpl["step_type"],
+                            PromptTemplate.is_active.is_(True),
+                        )
+                    )
+                    for row in old.scalars().all():
+                        row.is_active = False
                 db.add(PromptTemplate(**tpl, is_active=True))
 
         # Operator presets

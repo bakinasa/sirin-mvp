@@ -11,6 +11,46 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import OperatorPromptPreset, PromptTemplate
 from app.services.context_builder import build_context_bundle, render_context_as_text
 
+# Generic block document: sections and item fields are defined in the system prompt.
+BLOCK_DOCUMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["sections"],
+    "properties": {
+        "sections": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Разделы документа — состав и названия задаются SYSTEM PROMPT",
+            "items": {
+                "type": "object",
+                "required": ["title", "items"],
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Стабильный slug (snake_case). Можно опустить — будет сгенерирован из title",
+                    },
+                    "title": {"type": "string", "description": "Человекочитаемое название раздела"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "title": {"type": "string"},
+                                "description": {"type": "string"},
+                                "status": {"type": "string"},
+                            },
+                            "additionalProperties": True,
+                            "description": "Поля пункта — см. SYSTEM PROMPT; доп. ключи разрешены",
+                        },
+                    },
+                },
+            },
+        },
+        "clarifications_needed": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
 # Output contracts keep responses structured and cheap to parse.
 OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "draft_tz": {
@@ -71,96 +111,8 @@ OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
             "clarifications_needed": {"type": "array", "items": {"type": "string"}},
         },
     },
-    "profession_map": {
-        "type": "object",
-        "required": ["sections"],
-        "properties": {
-            "sections": {
-                "type": "array",
-                "minItems": 8,
-                "items": {
-                    "type": "object",
-                    "required": ["id", "title", "items"],
-                    "properties": {
-                        "id": {
-                            "type": "string",
-                            "description": "Один из: work_type, skills, assessment_points, errors, segment_ideas, contradictions, expert_questions, shooting_constraints",
-                        },
-                        "title": {"type": "string"},
-                        "items": {
-                            "type": "array",
-                            "minItems": 2,
-                            "items": {
-                                "type": "object",
-                                "required": ["id", "title", "description"],
-                                "properties": {
-                                    "id": {"type": "string"},
-                                    "title": {"type": "string"},
-                                    "description": {
-                                        "type": "string",
-                                        "description": "Развёрнутое описание 2–5 предложений",
-                                    },
-                                    "why_it_matters": {"type": "string"},
-                                    "observable_cues": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                    },
-                                    "source_hint": {"type": "string"},
-                                    "status": {"type": "string"},
-                                },
-                            },
-                        },
-                    },
-                },
-            }
-        },
-    },
-    "scenario_plan": {
-        "type": "object",
-        "required": ["sections"],
-        "properties": {
-            "sections": {
-                "type": "array",
-                "minItems": 8,
-                "items": {
-                    "type": "object",
-                    "required": ["id", "title", "items"],
-                    "properties": {
-                        "id": {
-                            "type": "string",
-                            "description": "Один из: passport, training_mode, diagnostic_mode, violation_categories, regulations, props, shooting_notes, constraints",
-                        },
-                        "title": {"type": "string"},
-                        "items": {
-                            "type": "array",
-                            "minItems": 1,
-                            "items": {
-                                "type": "object",
-                                "required": ["id", "title", "description"],
-                                "properties": {
-                                    "id": {"type": "string"},
-                                    "title": {"type": "string"},
-                                    "description": {
-                                        "type": "string",
-                                        "description": "Подробное описание сцены/пункта",
-                                    },
-                                    "learning_goal": {"type": "string"},
-                                    "assessment_points": {
-                                        "type": "array",
-                                        "items": {"type": "string"},
-                                    },
-                                    "props": {"type": "array", "items": {"type": "string"}},
-                                    "shooting_notes": {"type": "string"},
-                                    "frames": {"type": "array", "items": {"type": "object"}},
-                                    "status": {"type": "string"},
-                                },
-                            },
-                        },
-                    },
-                },
-            }
-        },
-    },
+    "profession_map": BLOCK_DOCUMENT_SCHEMA,
+    "scenario_plan": BLOCK_DOCUMENT_SCHEMA,
 }
 
 LOCAL_PATCH_SCHEMA = {
@@ -175,7 +127,7 @@ LOCAL_PATCH_SCHEMA = {
                 "properties": {
                     "target_id": {
                         "type": "string",
-                        "description": "id карточки или id раздела (например expert_questions)",
+                        "description": "id карточки или id раздела из текущего документа",
                     },
                     "action": {
                         "type": "string",
@@ -286,6 +238,9 @@ async def assemble_prompt(
         f"{context_text}\n\n"
         f"=== OPERATOR PROMPT ===\n{op}\n\n"
         f"=== OUTPUT SCHEMA (JSON) ===\n"
+        f"Структура разделов и полей пунктов задаётся SYSTEM PROMPT выше. "
+        f"Схема ниже — только каркас documents sections[] → items[]; "
+        f"дополнительные поля в пунктах разрешены.\n"
         f"Верни ТОЛЬКО валидный JSON по схеме:\n{schema}\n"
         "Если данных недостаточно — заполни clarifications_needed, не выдумывай факты.\n"
     )
@@ -328,11 +283,11 @@ async def assemble_chat_prompt(
         ),
         "local_edit": (
             "Ты вносишь локальное изменение в указанную цель документа.\n"
-            "Цель может быть карточкой (item) или целым разделом (section id, например expert_questions).\n"
-            "Если цель — раздел: меняй/добавляй только пункты этого раздела; не переноси в другие секции "
-            "(skills ≠ expert_questions).\n"
+            "Цель может быть карточкой (item) или целым разделом (section id из текущего документа).\n"
+            "Если цель — раздел: меняй/добавляй только пункты этого раздела; "
+            "не переноси содержимое в другие секции.\n"
             "Чтобы добавить пункт в раздел, используй action=add_item и new={id,title,description,...}.\n"
-            "Не переписывай другие разделы. Сохраняй стиль. "
+            "Не переписывай другие разделы. Сохраняй стиль и структуру полей, принятую в документе. "
             "Верни JSON patch: changes[].target_id, action?, old?, new, rationale."
         ),
         "global_edit": (

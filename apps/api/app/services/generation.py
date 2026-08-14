@@ -16,6 +16,7 @@ from app.llm.registry import build_provider
 from app.models import Artifact, PipelineRun, PipelineStep, PromptEditHistory, UserModel
 from app.security.crypto import decrypt_secret
 from app.services.document import ensure_ids
+from app.services.json_content import parse_llm_json_content
 from app.services.pipeline_gate import PipelineGateError, assert_can_run_step
 from app.services.prompt_assembler import assemble_prompt
 from app.llm.base import GenerateRequest
@@ -117,7 +118,7 @@ async def execute_run(db: AsyncSession, run_id: UUID) -> PipelineRun:
         if model is None:
             continue
         try:
-            result = await _call_model(db, model, assembled)
+            result = await _call_model(db, model, assembled, step.step_type)
             used_model = model
             used_fallback = attempt > 0
             break
@@ -150,7 +151,7 @@ async def execute_run(db: AsyncSession, run_id: UUID) -> PipelineRun:
             + (used_model.output_price or 0) * result.token_output / 1_000_000
         )
         run.fallback_used = used_fallback
-        content = _parse_json_content(result.content)
+        content = parse_llm_json_content(result.content)
 
     if step.step_type in (StepType.PROFESSION_MAP.value, StepType.SCENARIO_PLAN.value):
         content = ensure_ids(content, step.step_type)
@@ -187,7 +188,7 @@ async def execute_run(db: AsyncSession, run_id: UUID) -> PipelineRun:
     return run
 
 
-async def _call_model(db: AsyncSession, model: UserModel, assembled: dict):
+async def _call_model(db: AsyncSession, model: UserModel, assembled: dict, step_type: str = ""):
     # UserModel stores the full upstream connection config + encrypted BYOK.
     api_key = decrypt_secret(model.encrypted_api_key)
     if not api_key:
@@ -196,12 +197,17 @@ async def _call_model(db: AsyncSession, model: UserModel, assembled: dict):
     adapter = build_provider(
         model.provider_type, model.provider_name, model.base_url, model.capabilities_json
     )
+    max_tokens = (
+        8192
+        if step_type in (StepType.PROFESSION_MAP.value, StepType.SCENARIO_PLAN.value)
+        else 4096
+    )
     req = GenerateRequest(
         model=model.model_id,
         system=assembled["system_prompt"],
         user=assembled["user_message"],
         temperature=0.2,
-        max_tokens=4096,
+        max_tokens=max_tokens,
         response_json=True,
     )
     return await adapter.generate(api_key, req)
@@ -273,22 +279,8 @@ async def _next_version(db: AsyncSession, project_id: UUID, step_type: str) -> i
 
 
 def _parse_json_content(text: str) -> Any:
-    text = (text or "").strip()
-    if not text:
-        return {"raw": "", "clarifications_needed": ["Пустой ответ модели"]}
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # Strip markdown fences if present
-        if "```" in text:
-            inner = text.split("```")[1]
-            if inner.startswith("json"):
-                inner = inner[4:]
-            try:
-                return json.loads(inner.strip())
-            except json.JSONDecodeError:
-                pass
-        return {"raw_text": text, "clarifications_needed": ["Ответ не в JSON"]}
+    """Backward-compatible alias used by chat and sources."""
+    return parse_llm_json_content(text)
 
 
 def _mock_artifact(step_type: str, assembled: dict, reason: str = "") -> dict:
@@ -486,93 +478,136 @@ def _mock_artifact(step_type: str, assembled: dict, reason: str = "") -> dict:
             ],
         }
     if step_type == "profession_map":
-        from app.services.document import empty_document, ensure_ids
+        from app.services.document import ensure_ids
 
-        doc = empty_document("profession_map")
-        doc["sections"][0]["items"] = [
-            {
-                "id": "work_type_1",
-                "title": topic,
-                "description": work_ctx or f"Вид работ по проекту «{title}»",
-                "why": "Собрано из brief без вызова модели",
-                "in_scope": [topic],
-                "out_of_scope": [],
-                "sources": [],
-                "status": "proposed",
-            }
-        ]
-        doc["sections"][1]["items"] = [
-            {
-                "id": "skill_1",
-                "title": "Безопасное выполнение операции",
-                "description": f"Базовый навык для: {topic}",
-                "criticality": "high",
-                "status": "proposed",
-            }
-        ]
-        doc["sections"][2]["items"] = [
-            {
-                "id": "point_1",
-                "skill_id": "skill_1",
-                "title": "Соблюдение порядка действий",
-                "observe": "Последовательность операций в кадре",
-                "correct": "Действия по регламенту",
-                "violation": "Пропуск шага или нарушение порядка",
-                "visual": "средняя",
-                "can_360": True,
-                "status": "proposed",
-            }
-        ]
-        doc["sections"][6]["items"] = [
-            {
-                "id": "q_1",
-                "title": "Какие нарушения эксперты считают критичными?",
-                "why": "В brief недостаточно данных",
-                "status": "proposed",
-            }
-        ]
+        doc = {
+            "sections": [
+                {
+                    "id": "work_type",
+                    "title": "Вид работ для оценки",
+                    "items": [
+                        {
+                            "id": "work_type_1",
+                            "title": topic,
+                            "description": work_ctx or f"Вид работ по проекту «{title}»",
+                            "why": "Собрано из brief без вызова модели",
+                            "in_scope": [topic],
+                            "out_of_scope": [],
+                            "sources": [],
+                            "status": "proposed",
+                        }
+                    ],
+                },
+                {
+                    "id": "skills",
+                    "title": "Оцениваемые навыки",
+                    "items": [
+                        {
+                            "id": "skill_1",
+                            "title": "Безопасное выполнение операции",
+                            "description": f"Базовый навык для: {topic}",
+                            "criticality": "high",
+                            "status": "proposed",
+                        }
+                    ],
+                },
+                {
+                    "id": "assessment_points",
+                    "title": "Точки оценки",
+                    "items": [
+                        {
+                            "id": "point_1",
+                            "skill_id": "skill_1",
+                            "title": "Соблюдение порядка действий",
+                            "observe": "Последовательность операций в кадре",
+                            "correct": "Действия по регламенту",
+                            "violation": "Пропуск шага или нарушение порядка",
+                            "visual": "средняя",
+                            "can_360": True,
+                            "status": "proposed",
+                        }
+                    ],
+                },
+                {"id": "errors", "title": "Частые ошибки", "items": []},
+                {"id": "segment_ideas", "title": "Идеи видеосегментов", "items": []},
+                {"id": "contradictions", "title": "Противоречия и пробелы", "items": []},
+                {
+                    "id": "expert_questions",
+                    "title": "Вопросы для экспертов",
+                    "items": [
+                        {
+                            "id": "q_1",
+                            "title": "Какие нарушения эксперты считают критичными?",
+                            "why": "В brief недостаточно данных",
+                            "status": "proposed",
+                        }
+                    ],
+                },
+                {"id": "shooting_constraints", "title": "Ограничения для съёмки", "items": []},
+            ]
+        }
         return {**ensure_ids(doc, "profession_map"), **{k: base[k] for k in ("_mock", "_generation", "title")}}
 
     if step_type == "scenario_plan":
-        from app.services.document import empty_document, ensure_ids
+        from app.services.document import ensure_ids
 
-        doc = empty_document("scenario_plan")
-        doc["sections"][0]["items"] = [
-            {
-                "id": "passport_1",
-                "title": title,
-                "profession": profession,
-                "operation": topic,
-                "format": meta.get("delivery_format") or "VR / планшет",
-                "goal": brief.get("learning_objectives") or "",
-                "status": "proposed",
-            }
-        ]
-        doc["sections"][1]["items"] = [
-            {
-                "id": "train_seg_1",
-                "title": "Правильное выполнение",
-                "location": work_ctx or "рабочая площадка",
-                "frames": [
-                    {
-                        "id": "tf_1",
-                        "action": f"Показать корректное выполнение: {topic}",
-                        "focus": "Ключевые действия и СИЗ",
-                    }
-                ],
-                "status": "proposed",
-            }
-        ]
-        doc["sections"][2]["items"] = [
-            {
-                "id": "diag_seg_1",
-                "title": "Поиск нарушений",
-                "violation": pains or "Типовое нарушение порядка",
-                "stop_at": "момент, когда нарушение видно в кадре",
-                "assessment_points": ["point_1"],
-                "status": "proposed",
-            }
-        ]
+        doc = {
+            "sections": [
+                {
+                    "id": "passport",
+                    "title": "Паспорт сценария",
+                    "items": [
+                        {
+                            "id": "passport_1",
+                            "title": title,
+                            "profession": profession,
+                            "operation": topic,
+                            "format": meta.get("delivery_format") or "VR / планшет",
+                            "goal": brief.get("learning_objectives") or "",
+                            "status": "proposed",
+                        }
+                    ],
+                },
+                {
+                    "id": "training_mode",
+                    "title": "Режим «Обучение»",
+                    "items": [
+                        {
+                            "id": "train_seg_1",
+                            "title": "Правильное выполнение",
+                            "location": work_ctx or "рабочая площадка",
+                            "frames": [
+                                {
+                                    "id": "tf_1",
+                                    "action": f"Показать корректное выполнение: {topic}",
+                                    "focus": "Ключевые действия и СИЗ",
+                                }
+                            ],
+                            "status": "proposed",
+                        }
+                    ],
+                },
+                {
+                    "id": "diagnostic_mode",
+                    "title": "Режим «Диагностика»",
+                    "items": [
+                        {
+                            "id": "diag_seg_1",
+                            "title": "Поиск нарушений",
+                            "violation": pains or "Типовое нарушение порядка",
+                            "stop_at": "момент, когда нарушение видно в кадре",
+                            "assessment_points": ["point_1"],
+                            "status": "proposed",
+                        }
+                    ],
+                },
+                {"id": "violation_categories", "title": "Категории нарушений", "items": []},
+                {"id": "regulations", "title": "Правила и регламенты", "items": []},
+                {"id": "props", "title": "Реквизит и ресурсы", "items": []},
+                {"id": "shooting_notes", "title": "Съёмочные замечания", "items": []},
+                {"id": "constraints", "title": "Ограничения", "items": []},
+            ]
+        }
         return {**ensure_ids(doc, "scenario_plan"), **{k: base[k] for k in ("_mock", "_generation", "title")}}
     return base
 

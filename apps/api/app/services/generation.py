@@ -199,7 +199,12 @@ async def _call_model(db: AsyncSession, model: UserModel, assembled: dict, step_
     )
     max_tokens = (
         8192
-        if step_type in (StepType.PROFESSION_MAP.value, StepType.SCENARIO_PLAN.value)
+        if step_type
+        in (
+            StepType.PROFESSION_MAP.value,
+            StepType.SCENARIO_PLAN.value,
+            "source_summary",
+        )
         else 4096
     )
     req = GenerateRequest(

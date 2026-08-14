@@ -14,7 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from app.domain.enums import ParseStatus, SourceType
 from app.models import ProjectSource, ProjectSourceChunk
-from app.services.storage import upload_bytes
+from app.services.storage import delete_object_by_url, upload_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +258,19 @@ async def process_source(
         return source
 
     source.parsed_text = text
+    if not (text or "").strip():
+        source.parse_status = ParseStatus.FAILED.value
+        source.parse_error = (
+            "Из файла не удалось извлечь текст. Часто так бывает со сканами PDF без текстового слоя. "
+            "Загрузите DOCX/TXT или PDF, где текст можно выделить мышью."
+        )
+        source.summary_short_json = []
+        source.summary_structured_json = {}
+        source.important_chunks_json = []
+        await db.flush()
+        await db.refresh(source)
+        return source
+
     chunk_objs = await _replace_chunks(db, source, chunk_text(text))
 
     source.parse_status = ParseStatus.SUMMARIZING.value
@@ -307,6 +320,7 @@ async def summarize_source(
     fallback_model_id: Optional[UUID] = None,
 ) -> None:
     from app.services.generation import _call_model, _parse_json_content, _resolve_models
+    from app.services.json_content import extract_source_summary, summary_has_content
     from app.services.prompt_assembler import get_active_system_template
 
     template = await get_active_system_template(db, "source_summary")
@@ -336,25 +350,30 @@ async def summarize_source(
         if model is None:
             continue
         try:
-            result = await _call_model(db, model, assembled)
+            result = await _call_model(db, model, assembled, "source_summary")
             break
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
     if result is None:
         raise RuntimeError(last_error or "no model")
     payload = _parse_json_content(result.content)
-    if not isinstance(payload, dict):
-        payload = {"brief_points": [str(payload)]}
-    source.summary_short_json = payload.get("brief_points") or payload.get("short") or []
+    summary = extract_source_summary(payload)
+    if not summary_has_content(summary):
+        raise RuntimeError(
+            "Модель вернула пустую выжимку или ответ не разобрался как JSON. "
+            f"Сырой ответ: {(result.content or '')[:400]}"
+        )
+    source.summary_short_json = summary["brief_points"]
     source.summary_structured_json = {
-        "operations": payload.get("operations") or [],
-        "skills": payload.get("skills") or [],
-        "violations": payload.get("violations") or [],
-        "visual_points": payload.get("visual_points") or [],
-        "constraints": payload.get("constraints") or [],
-        "terms": payload.get("terms") or [],
+        "operations": summary["operations"],
+        "skills": summary["skills"],
+        "violations": summary["violations"],
+        "visual_points": summary["visual_points"],
+        "constraints": summary["constraints"],
+        "terms": summary["terms"],
     }
-    source.important_chunks_json = payload.get("important_fragments") or []
+    source.important_chunks_json = summary["important_fragments"]
+    source.parse_error = ""
 
 
 async def search_chunks(
@@ -413,6 +432,13 @@ async def list_sources(db: AsyncSession, project_id: UUID) -> list[ProjectSource
         .order_by(ProjectSource.created_at.desc())
     )
     return list(result.scalars().all())
+
+
+async def delete_source(db: AsyncSession, source: ProjectSource) -> None:
+    """Remove source, chunks and original file. Summaries live on the source row."""
+    delete_object_by_url(source.file_path)
+    await db.delete(source)
+    await db.flush()
 
 
 def source_to_out(source: ProjectSource, *, detail: bool = False) -> dict[str, Any]:

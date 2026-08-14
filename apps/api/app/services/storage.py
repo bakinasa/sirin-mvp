@@ -40,3 +40,23 @@ def upload_bytes(object_name: str, data: bytes, content_type: str) -> str:
         content_type=content_type,
     )
     return f"{settings.minio_public_url}/{settings.minio_bucket}/{object_name}"
+
+
+def delete_object_by_url(file_path: str) -> None:
+    """Best-effort delete of a stored original. Ignore missing objects."""
+    if not file_path:
+        return
+    settings = get_settings()
+    prefix = f"{settings.minio_public_url.rstrip('/')}/{settings.minio_bucket}/"
+    object_name = file_path
+    if file_path.startswith(prefix):
+        object_name = file_path[len(prefix) :]
+    elif f"/{settings.minio_bucket}/" in file_path:
+        object_name = file_path.split(f"/{settings.minio_bucket}/", 1)[1]
+    object_name = object_name.lstrip("/")
+    if not object_name:
+        return
+    try:
+        get_minio().remove_object(settings.minio_bucket, object_name)
+    except Exception:
+        return

@@ -160,6 +160,13 @@ export function BriefEditorPage() {
     await reloadSources();
   }
 
+  async function removeSource(id: string, title: string) {
+    if (!window.confirm(`Удалить файл «${title}» и его выжимку?`)) return;
+    await api(`/sources/${id}`, { method: "DELETE" });
+    if (preview?.id === id) setPreview(null);
+    await reloadSources();
+  }
+
   async function showSource(id: string) {
     setPreview(await api<ProjectSource>(`/sources/${id}`));
   }
@@ -344,6 +351,13 @@ export function BriefEditorPage() {
                       <button type="button" className="btn-ghost" onClick={() => void reprocess(s.id)}>
                         Пересобрать
                       </button>
+                      <button
+                        type="button"
+                        className="btn-ghost text-red-700 dark:text-red-400"
+                        onClick={() => void removeSource(s.id, s.title)}
+                      >
+                        Удалить
+                      </button>
                     </div>
                   </div>
                   {Array.isArray(s.summary_short_json) && s.summary_short_json.length > 0 && (
@@ -377,7 +391,15 @@ export function BriefEditorPage() {
 
       {preview && (
         <Modal title={preview.title} onClose={() => setPreview(null)} wide>
-          <p className="mb-2 text-xs text-neutral-500">{preview.parse_status}</p>
+          <p className="mb-2 text-xs text-neutral-500">
+            {preview.parse_status}
+            {preview.has_parsed_text ? " · текст извлечён" : " · текст не извлечён"}
+          </p>
+          {preview.parse_error && (
+            <p className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm dark:border-amber-800 dark:bg-amber-950/40">
+              {preview.parse_error}
+            </p>
+          )}
           <h3 className="mb-1 font-semibold">Краткая выжимка</h3>
           <pre className="mb-4 max-h-40 overflow-auto whitespace-pre-wrap text-sm">
             {JSON.stringify(preview.summary_short_json, null, 2)}
@@ -387,9 +409,17 @@ export function BriefEditorPage() {
             {JSON.stringify(preview.summary_structured_json, null, 2)}
           </pre>
           <h3 className="mb-1 font-semibold">Важные фрагменты</h3>
-          <pre className="max-h-40 overflow-auto whitespace-pre-wrap text-sm">
+          <pre className="mb-4 max-h-40 overflow-auto whitespace-pre-wrap text-sm">
             {JSON.stringify(preview.important_chunks_json, null, 2)}
           </pre>
+          {preview.parsed_text ? (
+            <>
+              <h3 className="mb-1 font-semibold">Извлечённый текст (начало)</h3>
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap text-xs text-neutral-600 dark:text-neutral-300">
+                {preview.parsed_text.slice(0, 2500)}
+              </pre>
+            </>
+          ) : null}
         </Modal>
       )}
     </div>

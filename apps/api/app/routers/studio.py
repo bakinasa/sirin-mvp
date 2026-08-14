@@ -28,6 +28,7 @@ from app.services.chat import chat, list_sessions, promote_ask_to_patch
 from app.services.comments import create_comment, list_threads, resolve_thread
 from app.services.generation import create_pipeline_run
 from app.services.pipeline_gate import PipelineGateError
+from app.services.document import ensure_ids
 from app.services.stages import (
     StageEditError,
     apply_patch,
@@ -53,13 +54,21 @@ def _http(exc: Exception) -> HTTPException:
     return HTTPException(500, str(exc))
 
 
+def _normalize_artifact_content(artifact: Artifact | None, step_type: str) -> Artifact | None:
+    if artifact is None or not isinstance(artifact.content, dict):
+        return artifact
+    artifact.content = ensure_ids(artifact.content, step_type)
+    return artifact
+
+
 @router.get("/projects/{project_id}/profession-map", response_model=ArtifactOut | None)
 async def get_profession_map(
     project_id: UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    return await get_current_artifact(db, project_id, StepType.PROFESSION_MAP.value)
+    art = await get_current_artifact(db, project_id, StepType.PROFESSION_MAP.value)
+    return _normalize_artifact_content(art, StepType.PROFESSION_MAP.value)
 
 
 @router.post("/projects/{project_id}/profession-map/generate", response_model=PipelineRunOut)
@@ -194,7 +203,8 @@ async def get_scenario(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    return await get_current_artifact(db, project_id, StepType.SCENARIO_PLAN.value)
+    art = await get_current_artifact(db, project_id, StepType.SCENARIO_PLAN.value)
+    return _normalize_artifact_content(art, StepType.SCENARIO_PLAN.value)
 
 
 @router.post("/projects/{project_id}/scenario/generate", response_model=PipelineRunOut)

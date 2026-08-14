@@ -3,79 +3,67 @@
 from __future__ import annotations
 
 import copy
+import re
 import uuid
 from typing import Any, Optional
 
 from app.domain.enums import ItemStatus, StepType
+from app.services.json_content import recover_sections_from_payload
 
-PROFESSION_MAP_SECTIONS = [
-    ("work_type", "Вид работ для оценки"),
-    ("skills", "Оцениваемые навыки"),
-    ("assessment_points", "Точки оценки"),
-    ("errors", "Частые ошибки и опасные ситуации"),
-    ("segment_ideas", "Идеи видеосегментов"),
-    ("contradictions", "Противоречия и пробелы"),
-    ("expert_questions", "Вопросы для экспертов"),
-    ("shooting_constraints", "Ограничения для съёмки"),
-]
+_BLOCK_STEP_TYPES = frozenset(
+    {StepType.PROFESSION_MAP.value, StepType.SCENARIO_PLAN.value}
+)
 
-SCENARIO_PLAN_SECTIONS = [
-    ("passport", "Паспорт сценария"),
-    ("training_mode", "Режим «Обучение»"),
-    ("diagnostic_mode", "Режим «Диагностика»"),
-    ("violation_categories", "Категории нарушений"),
-    ("regulations", "Правила и регламенты"),
-    ("props", "Реквизит и ресурсы"),
-    ("shooting_notes", "Съёмочные замечания"),
-    ("constraints", "Ограничения"),
-]
+# Top-level keys that are not promoted into sections when parsing legacy shapes.
+_DOC_META_KEYS = frozenset(
+    {
+        "sections",
+        "title",
+        "clarifications_needed",
+        "_mock",
+        "_generation",
+        "raw",
+        "raw_text",
+        "summary",
+        "summary_ru",
+    }
+)
 
 
 def empty_document(step_type: str) -> dict[str, Any]:
-    specs = (
-        PROFESSION_MAP_SECTIONS
-        if step_type == StepType.PROFESSION_MAP.value
-        else SCENARIO_PLAN_SECTIONS
-    )
-    return {
-        "sections": [
-            {"id": sid, "title": title, "items": []}
-            for sid, title in specs
-        ]
-    }
+    if step_type in _BLOCK_STEP_TYPES:
+        return {"sections": []}
+    return {"sections": []}
 
 
 def ensure_ids(content: Any, step_type: str) -> dict[str, Any]:
-    """Normalize LLM output into a sections[] document with stable ids."""
+    """Normalize LLM output into a sections[] document with stable ids.
+
+    Section list and item fields come from the model / prompt — not from
+    hardcoded backend specs. We only guarantee id, title, items[] shape.
+    """
     if not isinstance(content, dict):
         content = {"raw": content}
 
-    specs = (
-        PROFESSION_MAP_SECTIONS
-        if step_type == StepType.PROFESSION_MAP.value
-        else SCENARIO_PLAN_SECTIONS
-        if step_type == StepType.SCENARIO_PLAN.value
-        else None
-    )
-    if specs is None:
+    if step_type not in _BLOCK_STEP_TYPES:
         return content
 
     doc = copy.deepcopy(content)
+    recovered = recover_sections_from_payload(doc)
+    if recovered is not None:
+        doc = recovered
+
     sections = doc.get("sections")
     if not isinstance(sections, list) or not sections:
-        sections = _promote_keys_to_sections(doc, specs)
-    by_id = {s.get("id"): s for s in sections if isinstance(s, dict) and s.get("id")}
+        sections = _promote_keys_to_sections(doc)
+
+    used_section_ids: set[str] = set()
     ordered: list[dict[str, Any]] = []
-    for sid, title in specs:
-        section = by_id.get(sid) or {"id": sid, "title": title, "items": []}
-        section["id"] = sid
-        section.setdefault("title", title)
-        items = section.get("items")
-        if not isinstance(items, list):
-            items = _wrap_as_items(items, sid)
-        section["items"] = [_normalize_item(it, sid, i) for i, it in enumerate(items)]
-        _ensure_nested_ids(section["items"], sid)
-        ordered.append(section)
+    for idx, section in enumerate(sections):
+        if not isinstance(section, dict):
+            section = {"title": str(section), "items": []}
+        ordered.append(_normalize_section(section, idx, used_section_ids))
+
     doc["sections"] = ordered
     return doc
 
@@ -252,29 +240,6 @@ def item_field_template(section_items: list[Any]) -> dict[str, Any]:
     return template
 
 
-def _append_items(content: dict[str, Any], section_or_item_id: str, new_items: list[dict[str, Any]]) -> bool:
-    """Append items into a section (or nested items list)."""
-    for section in content.get("sections") or []:
-        if section.get("id") == section_or_item_id:
-            append_section_items(content, section_or_item_id, new_items)
-            return True
-        items = section.get("items") or []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("id") == section_or_item_id:
-                nested = item.setdefault("items", [])
-                if not isinstance(nested, list):
-                    item["items"] = []
-                    nested = item["items"]
-                for it in new_items:
-                    it = dict(it)
-                    it.setdefault("id", f"{section_or_item_id}-{uuid.uuid4().hex[:8]}")
-                    nested.append(it)
-                return True
-    return False
-
-
 def document_outline(content: dict[str, Any]) -> list[dict[str, Any]]:
     outline = []
     for section in content.get("sections") or []:
@@ -311,6 +276,43 @@ def section_summaries(content: dict[str, Any], limit_chars: int = 400) -> list[d
             }
         )
     return out
+
+
+def _normalize_section(section: dict[str, Any], index: int, used_ids: set[str]) -> dict[str, Any]:
+    section = copy.deepcopy(section)
+    title = str(section.get("title") or section.get("name") or f"Раздел {index + 1}").strip()
+    sid = section.get("id")
+    if sid:
+        sid = str(sid).strip()
+    else:
+        sid = _slug_id(title, f"section_{index + 1}")
+    sid = _unique_id(sid, used_ids)
+    used_ids.add(sid)
+
+    section["id"] = sid
+    section["title"] = title
+    items = section.get("items")
+    if not isinstance(items, list):
+        items = _wrap_as_items(items, sid)
+    section["items"] = [_normalize_item(it, sid, i) for i, it in enumerate(items)]
+    _ensure_nested_ids(section["items"], sid)
+    return section
+
+
+def _slug_id(text: str, fallback: str) -> str:
+    s = text.strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
+    s = re.sub(r"[\s\-]+", "_", s).strip("_")
+    return (s or fallback)[:80]
+
+
+def _unique_id(base: str, used: set[str]) -> str:
+    if base not in used:
+        return base
+    n = 2
+    while f"{base}_{n}" in used:
+        n += 1
+    return f"{base}_{n}"
 
 
 def _walk_items(items: list) -> list[dict[str, Any]]:
@@ -365,17 +367,47 @@ def _wrap_as_items(value: Any, section_id: str) -> list:
     return [{"id": f"{section_id}_1", "title": str(value), "content": value}]
 
 
-def _promote_keys_to_sections(doc: dict[str, Any], specs: list[tuple[str, str]]) -> list[dict[str, Any]]:
+def _promote_keys_to_sections(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Legacy: top-level keys become sections when sections[] is missing."""
     sections = []
-    for sid, title in specs:
-        raw = doc.get(sid)
-        items = _wrap_as_items(raw, sid) if raw is not None else []
-        sections.append({"id": sid, "title": title, "items": items})
+    for key, raw in doc.items():
+        if key in _DOC_META_KEYS:
+            continue
+        title = str(key).replace("_", " ").strip().title()
+        items = _wrap_as_items(raw, str(key))
+        sections.append({"id": str(key), "title": title, "items": items})
     return sections
 
 
+def _append_items(content: dict[str, Any], section_or_item_id: str, new_items: list[dict[str, Any]]) -> bool:
+    """Append items into a section (or nested items list)."""
+    for section in content.get("sections") or []:
+        if section.get("id") == section_or_item_id:
+            append_section_items(content, section_or_item_id, new_items)
+            return True
+        items = section.get("items") or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") == section_or_item_id:
+                nested = item.setdefault("items", [])
+                if not isinstance(nested, list):
+                    item["items"] = []
+                    nested = item["items"]
+                for it in new_items:
+                    it = dict(it)
+                    it.setdefault("id", f"{section_or_item_id}-{uuid.uuid4().hex[:8]}")
+                    nested.append(it)
+                return True
+    return False
+
+
 def _guess_step(doc: dict[str, Any]) -> str:
+    """Best-effort step type when only document JSON is available."""
     ids = {s.get("id") for s in (doc.get("sections") or []) if isinstance(s, dict)}
-    if "training_mode" in ids or "passport" in ids:
+    titles = " ".join(
+        str(s.get("title") or "") for s in (doc.get("sections") or []) if isinstance(s, dict)
+    ).lower()
+    if any(k in ids for k in ("passport", "training_mode", "diagnostic_mode")) or "сценар" in titles:
         return StepType.SCENARIO_PLAN.value
     return StepType.PROFESSION_MAP.value

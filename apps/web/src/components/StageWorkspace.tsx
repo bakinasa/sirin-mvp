@@ -82,6 +82,12 @@ export function StageWorkspace({
 
   const doc = useMemo(() => asDoc(artifact?.content), [artifact]);
   const sections = doc.sections || [];
+  const parseWarnings = useMemo(() => {
+    const raw = artifact?.content;
+    if (!raw || typeof raw !== "object") return [] as string[];
+    const notes = (raw as Record<string, unknown>).clarifications_needed;
+    return Array.isArray(notes) ? notes.map(String) : [];
+  }, [artifact?.content]);
   const currentSection = sections.find((s) => s.id === sectionId) || sections[0];
 
   const sectionComments = useMemo(
@@ -263,10 +269,9 @@ export function StageWorkspace({
               даже если карточка не выбрана.
             </li>
             <li>
-              <b>В центре</b> кликните карточку, чтобы править точечно. Поля карточки можно менять руками; лишние
-              строковые поля появятся, если модель их добавила. Стабильные id разделов (`skills`, `expert_questions`…)
-              лучше не переименовывать — интерфейс на них опирается. Содержимое полей и пунктов внутри раздела менять
-              можно.
+              <b>В центре</b> кликните карточку, чтобы править точечно. Поля карточки можно менять руками;
+              состав полей задаётся промптом и ответом модели. Разделы слева — те, что вернула генерация
+              (названия и состав можно менять через промпт на шаге «Промты»).
             </li>
             <li>
               Справа: ввод → ниже <b>режим</b> (вопрос / правка цели / всё / коммент. / пункт) и <b>модель</b>.
@@ -283,6 +288,19 @@ export function StageWorkspace({
         )}
       </div>
 
+      {parseWarnings.length > 0 && (
+        <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">
+          <p className="font-semibold">Ответ модели не разобран полностью</p>
+          <ul className="mt-1 list-disc pl-5">
+            {parseWarnings.map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+          <p className="mt-2 text-xs text-neutral-600 dark:text-neutral-400">
+            Часто это обрезка JSON на лимите токенов. Пересоберите документ или сократите требования в промпте.
+          </p>
+        </div>
+      )}
       {outdated && (
         <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">
           Карта профессии изменилась. Этот сценарий устарел — пересоберите его.

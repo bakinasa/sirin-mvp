@@ -83,6 +83,7 @@ export function PromptsPage() {
         <h1 className="text-3xl font-semibold tracking-tight">Промты</h1>
         <p className="mt-1 max-w-3xl text-sm text-neutral-600 dark:text-neutral-300">
           Только рабочие системные шаблоны пайплайна. Правьте текст — он уходит в модель как system prompt.
+          Для карты и сценария: состав разделов и полей пунктов задаётся здесь; бэкенд сохраняет то, что вернула модель.
         </p>
       </div>
 

@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy import select
@@ -9,6 +9,7 @@ from app.db import get_db
 from app.deps import get_current_user
 from app.models import ProjectSource, User
 from app.schemas import SourceDetailOut, SourceOut, SourceReprocessIn
+from app.services.source_jobs import schedule_summary_job
 from app.services.sources import (
     create_source_from_upload,
     delete_source,
@@ -33,6 +34,7 @@ async def get_sources(
 @router.post("/projects/{project_id}/sources", response_model=SourceOut)
 async def upload_source(
     project_id: UUID,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     source_type: str | None = Form(default=None),
     primary_model_id: str | None = Form(default=None),
@@ -59,6 +61,8 @@ async def upload_source(
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"Не удалось обработать файл: {exc}") from exc
+    if source.parse_status == "summarizing":
+        background_tasks.add_task(schedule_summary_job, source.id)
     return SourceOut.model_validate(source_to_out(source))
 
 
@@ -82,6 +86,7 @@ async def get_source(
 @router.post("/sources/{source_id}/reprocess", response_model=SourceOut)
 async def reprocess(
     source_id: UUID,
+    background_tasks: BackgroundTasks,
     body: SourceReprocessIn | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -102,6 +107,8 @@ async def reprocess(
         primary_model_id=payload.primary_model_id,
         fallback_model_id=payload.fallback_model_id,
     )
+    if source.parse_status == "summarizing":
+        background_tasks.add_task(schedule_summary_job, source.id)
     return SourceOut.model_validate(source_to_out(source))
 
 

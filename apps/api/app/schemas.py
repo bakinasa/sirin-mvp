@@ -454,6 +454,7 @@ class SourceOut(BaseModel):
     summary_short_json: Any
     summary_structured_json: Any
     important_chunks_json: Any
+    summary_progress: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
     has_parsed_text: bool = False

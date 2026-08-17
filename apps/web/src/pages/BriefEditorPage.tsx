@@ -41,6 +41,18 @@ export function BriefEditorPage() {
   }, [projectId]);
 
   useEffect(() => {
+    if (!projectId || tab !== "sources") return;
+    const hasPending = sources.some(
+      (s) => s.parse_status === "summarizing" || s.parse_status === "parsing" || s.parse_status === "pending"
+    );
+    if (!hasPending) return;
+    const timerId = window.setInterval(() => {
+      void reloadSources();
+    }, 3000);
+    return () => window.clearInterval(timerId);
+  }, [projectId, tab, sources, reloadSources]);
+
+  useEffect(() => {
     if (!projectId) return;
     Promise.all([
       api<Brief>(`/projects/${projectId}/brief`),
@@ -337,7 +349,7 @@ export function BriefEditorPage() {
               accept=".pdf,.docx,.txt,.md,.doc,application/pdf"
               onChange={(e) => void onFiles(e.target.files)}
             />
-            {uploading ? "Обрабатываем файл…" : "Перетащите файлы сюда или нажмите, чтобы выбрать (PDF, DOCX, TXT)"}
+            {uploading ? "Загружаем и ставим в очередь…" : "Перетащите файлы сюда или нажмите, чтобы выбрать (PDF, DOCX, TXT)"}
           </label>
           {sources.length === 0 ? (
             <div className="panel text-sm text-neutral-500">Пока нет материалов. Загрузите СОП, инструкции, регламенты.</div>
@@ -350,8 +362,22 @@ export function BriefEditorPage() {
                       <p className="font-semibold">{s.title}</p>
                       <p className="text-xs text-neutral-500">
                         {s.source_type} · {s.parse_status}
-                        {s.parse_error ? ` · ${s.parse_error}` : ""}
+                        {s.parse_status === "summarizing" && s.summary_progress?.part_total
+                          ? ` · ${s.summary_progress.message || `часть ${s.summary_progress.part_done}/${s.summary_progress.part_total}`}`
+                          : ""}
+                        {s.parse_error && s.parse_status !== "summarizing" ? ` · ${s.parse_error}` : ""}
+                        {s.parse_error && s.parse_status === "summarizing" && !s.summary_progress?.part_total
+                          ? ` · ${s.parse_error}`
+                          : ""}
                       </p>
+                      {s.parse_status === "summarizing" && (s.summary_progress?.part_total ?? 0) > 0 && (
+                        <div className="mt-1 h-1.5 w-full max-w-xs overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
+                          <div
+                            className="h-full rounded-full bg-sky-500 transition-all"
+                            style={{ width: `${s.summary_progress?.percent ?? 0}%` }}
+                          />
+                        </div>
+                      )}
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <button type="button" className="btn-ghost" onClick={() => void showSource(s.id)}>
@@ -489,9 +515,13 @@ function SourceSummaryHelp({
             <li>Файл сохраняется, из PDF / DOCX / TXT извлекается текст.</li>
             <li>Текст режется на фрагменты (~1100 символов с перекрытием 150) — они нужны для поиска, не для самой выжимки.</li>
             <li>
-              Модель получает системный промпт ниже и <b>весь извлечённый текст</b> (длинный документ режется на части,
-              выжимки потом объединяются). Ответ ждут как JSON: пункты, операции, навыки, нарушения, визуальные точки,
-              ограничения, термины и дословные цитаты.
+              Модель получает системный промпт ниже и <b>весь извлечённый текст</b>. Длинный документ режется на части
+              по границам страниц; до 3 частей обрабатываются параллельно, затем выжимки объединяются. Ответ — JSON:
+              пункты, операции, навыки, нарушения, визуальные точки, ограничения, термины и цитаты.
+            </li>
+            <li>
+              Загрузка возвращается сразу после извлечения текста; выжимка идёт в фоне со статусом summarizing и
+              прогрессом по частям.
             </li>
             <li>
               В карту и сценарий потом уходит эта выжимка, а не весь файл. По запросу добавляются несколько найденных

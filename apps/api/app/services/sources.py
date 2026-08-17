@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
+import re
 import uuid
 from typing import Any, Optional
 from uuid import UUID
@@ -13,14 +15,19 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.db import AsyncSessionLocal
 from app.domain.enums import ParseStatus, SourceType
 from app.models import ProjectSource, ProjectSourceChunk
+from app.services.source_jobs import build_summary_job, update_summary_progress
 from app.services.storage import delete_object_by_url, upload_bytes
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1100
 CHUNK_OVERLAP = 150
+SUMMARY_PART_SIZE = 16000
+SUMMARY_PART_OVERLAP = 600
+SUMMARY_PARALLEL_PARTS = 3
 
 SOURCE_SUMMARY_PROMPT = """Ты выполняешь высокоточную выжимку документа по профессии, операции, инструкции, процедуре или нормативным требованиям.
 
@@ -237,6 +244,9 @@ async def process_source(
 ) -> ProjectSource:
     source.parse_status = ParseStatus.PARSING.value
     source.parse_error = ""
+    source.summary_short_json = []
+    source.summary_structured_json = {}
+    source.important_chunks_json = []
     await db.flush()
 
     text, status = parse_file_bytes(
@@ -274,24 +284,27 @@ async def process_source(
 
     await _replace_chunks(db, source, chunk_text(text))
 
+    parts = _split_for_summary(text)
     source.parse_status = ParseStatus.SUMMARIZING.value
-    await db.flush()
-    try:
-        await summarize_source(
-            db, source, user_id, primary_model_id, fallback_model_id
-        )
-        source.parse_status = ParseStatus.READY.value
-        source.parse_error = ""
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Summary failed for source %s: %s", source.id, exc)
-        source.parse_status = ParseStatus.FAILED.value
-        source.parse_error = f"Выжимка не удалась: {exc}"
-        source.summary_short_json = []
-        source.summary_structured_json = {}
-        source.important_chunks_json = []
+    source.parse_error = "Текст извлечён, выжимка в очереди"
+    source.summary_job_json = build_summary_job(
+        user_id=user_id,
+        primary_model_id=primary_model_id,
+        fallback_model_id=fallback_model_id,
+        part_total=len(parts),
+    )
     await db.flush()
     await db.refresh(source)
     return source
+
+
+async def finalize_summary_failure(source: ProjectSource, exc: Exception | str) -> None:
+    message = str(exc)
+    source.parse_status = ParseStatus.FAILED.value
+    source.parse_error = f"Выжимка не удалась: {message}"
+    source.summary_short_json = []
+    source.summary_structured_json = {}
+    source.important_chunks_json = []
 
 
 async def reprocess_source(
@@ -332,9 +345,16 @@ async def summarize_source(
         raise RuntimeError("Нет доступной модели для выжимки. Добавьте модель на странице «Модели».")
 
     parts = _split_for_summary(source.parsed_text or "")
-    part_summaries: list[dict[str, Any]] = []
-    last_error = ""
-    for index, part in enumerate(parts):
+    total = len(parts) or 1
+    await update_summary_progress(db, source, part_done=0, part_total=total, message="Подготовка")
+
+    semaphore = asyncio.Semaphore(SUMMARY_PARALLEL_PARTS)
+    progress_lock = asyncio.Lock()
+    completed = 0
+    ordered: list[dict[str, Any] | None] = [None] * len(parts)
+
+    async def run_part(index: int, part: str) -> None:
+        nonlocal completed
         assembled = {
             "system_prompt": system,
             "user_message": _summary_user_message(
@@ -345,17 +365,37 @@ async def summarize_source(
                 part_count=len(parts),
             ),
         }
-        summary = None
+        last_error = ""
+        summary: dict[str, Any] | None = None
         for model in models:
             try:
-                summary = await _summarize_once(db, model, assembled)
+                async with semaphore:
+                    async with AsyncSessionLocal() as part_db:
+                        summary = await _summarize_once(part_db, model, assembled)
                 break
             except Exception as exc:  # noqa: BLE001
                 last_error = str(exc)
-                logger.warning("Summary call failed (%s part %s): %s", model.model_id, index + 1, exc)
-        if not summary:
+                logger.warning(
+                    "Summary call failed (%s part %s): %s", model.model_id, index + 1, exc
+                )
+        if summary is None:
             raise RuntimeError(last_error or "Модель вернула пустой ответ на выжимку")
-        part_summaries.append(summary)
+
+        ordered[index] = summary
+        async with progress_lock:
+            completed += 1
+            await update_summary_progress(
+                db,
+                source,
+                part_done=completed,
+                part_total=total,
+                message=f"Выжимка: часть {completed}/{total}",
+            )
+
+    await asyncio.gather(*[run_part(index, part) for index, part in enumerate(parts)])
+    part_summaries = [part for part in ordered if part is not None]
+    if len(part_summaries) != len(parts):
+        raise RuntimeError("Не все части документа удалось обработать")
 
     merged = _merge_summaries(part_summaries)
     if not summary_has_content(merged):
@@ -375,12 +415,16 @@ async def summarize_source(
 
 
 async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any]:
-    from app.services.generation import _call_model, _parse_json_content
-    from app.services.json_content import extract_source_summary, summary_has_content
+    from app.services.generation import _call_model
+    from app.services.json_content import (
+        extract_source_summary,
+        parse_summary_json_content,
+        summary_has_content,
+    )
 
     attempts = (
-        {"response_json": False, "max_tokens": 16384, "timeout_seconds": 240},
-        {"response_json": True, "max_tokens": 8192, "timeout_seconds": 240},
+        {"response_json": False, "max_tokens": 16384, "timeout_seconds": 300},
+        {"response_json": True, "max_tokens": 8192, "timeout_seconds": 300},
     )
     errors: list[str] = []
     for kwargs in attempts:
@@ -401,12 +445,13 @@ async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any
                 f"{', finish=' + finish if finish else ''})"
             )
             continue
-        summary = extract_source_summary(_parse_json_content(content))
+        summary = extract_source_summary(parse_summary_json_content(content))
         if not summary_has_content(summary):
             summary = extract_source_summary(content)
         if summary_has_content(summary):
             return summary
-        errors.append("ответ модели не разобрался как JSON выжимки")
+        preview = content[:500].replace("\n", " ").strip()
+        errors.append(f"ответ модели не разобрался как JSON выжимки: {preview}")
     raise RuntimeError("; ".join(errors) or "не удалось получить выжимку")
 
 
@@ -422,7 +467,8 @@ def _summary_user_message(
     if part_count > 1:
         part_note = (
             f"Это часть {part_index + 1} из {part_count} документа. "
-            "Сделай выжимку этой части; не пиши, что данных нет, если в части есть факты.\n\n"
+            "Сделай компактную выжимку только этой части (brief_points: 5–8 пунктов); "
+            "не пиши, что данных нет, если в части есть факты.\n\n"
         )
     return (
         f"Файл: {title}\n"
@@ -432,26 +478,72 @@ def _summary_user_message(
         "Сохраняй критические детали: числа, единицы измерения, сроки, роли, последовательности действий, "
         "условия, исключения, запреты, критерии проверки и основания для нарушений.\n"
         "Не объединяй разные нормы в один общий пункт.\n"
+        "Все поля JSON — массивы строк (не объекты). Ключи строго на английском: "
+        "brief_points, operations, skills, violations, visual_points, constraints, terms, important_fragments.\n"
         "Верни ТОЛЬКО JSON.\n\n"
         f"=== DOCUMENT TEXT ===\n{text}\n=== END ==="
     )
 
 
-def _split_for_summary(text: str, size: int = 24000, overlap: int = 600) -> list[str]:
+def _split_for_summary(
+    text: str,
+    size: int = SUMMARY_PART_SIZE,
+    overlap: int = SUMMARY_PART_OVERLAP,
+) -> list[str]:
     text = (text or "").strip()
     if not text:
         return []
     if len(text) <= size:
         return [text]
+    if "[page " in text:
+        page_parts = _split_for_summary_by_pages(text, size=size)
+        if page_parts:
+            return page_parts
+    return _split_for_summary_by_chars(text, size=size, overlap=overlap)
+
+
+def _split_for_summary_by_pages(text: str, *, size: int) -> list[str]:
+    blocks = [block for block in re.split(r"(?=\[page \d+\])", text) if block.strip()]
+    if len(blocks) <= 1:
+        return []
+
+    parts: list[str] = []
+    current = ""
+    for block in blocks:
+        if len(block) > size:
+            if current:
+                parts.append(current)
+                current = ""
+            parts.extend(_split_for_summary_by_chars(block, size=size, overlap=SUMMARY_PART_OVERLAP))
+            continue
+        candidate = f"{current}\n\n{block}".strip() if current else block
+        if len(candidate) <= size:
+            current = candidate
+        else:
+            if current:
+                parts.append(current)
+            current = block
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _split_for_summary_by_chars(text: str, *, size: int, overlap: int) -> list[str]:
     parts: list[str] = []
     start = 0
     while start < len(text):
         end = min(len(text), start + size)
-        parts.append(text[start:end])
+        if end < len(text):
+            cut = text.rfind("\n\n", start + size // 2, end)
+            if cut <= start:
+                cut = text.rfind(" ", start + size // 2, end)
+            if cut > start:
+                end = cut
+        parts.append(text[start:end].strip())
         if end >= len(text):
             break
-        start = end - overlap
-    return parts
+        start = max(end - overlap, start + 1)
+    return [part for part in parts if part]
 
 
 def _merge_summaries(parts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -544,6 +636,8 @@ async def delete_source(db: AsyncSession, source: ProjectSource) -> None:
 
 
 def source_to_out(source: ProjectSource, *, detail: bool = False) -> dict[str, Any]:
+    from app.services.source_jobs import summary_progress
+
     payload = {
         "id": source.id,
         "project_id": source.project_id,
@@ -556,6 +650,7 @@ def source_to_out(source: ProjectSource, *, detail: bool = False) -> dict[str, A
         "summary_short_json": source.summary_short_json,
         "summary_structured_json": source.summary_structured_json,
         "important_chunks_json": source.important_chunks_json,
+        "summary_progress": summary_progress(source),
         "created_at": source.created_at,
         "updated_at": source.updated_at,
         "has_parsed_text": bool(source.parsed_text),

@@ -388,6 +388,7 @@ class ProjectSource(Base, TimestampMixin):
     summary_short_json: Mapped[Any] = mapped_column(JSONB, nullable=False, default=list)
     summary_structured_json: Mapped[Any] = mapped_column(JSONB, nullable=False, default=dict)
     important_chunks_json: Mapped[Any] = mapped_column(JSONB, nullable=False, default=list)
+    summary_job_json: Mapped[Any] = mapped_column(JSONB, nullable=False, default=dict)
     created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )

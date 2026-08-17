@@ -1,4 +1,4 @@
-"""Background worker: polls queued pipeline runs (backup to inline execution)."""
+"""Background worker: queued pipeline runs + source summarization."""
 
 from __future__ import annotations
 
@@ -16,12 +16,13 @@ from app.db import AsyncSessionLocal
 from app.domain.enums import RunStatus
 from app.models import PipelineRun
 from app.services.generation import execute_run
+from app.services.source_jobs import poll_summary_jobs
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("worker")
 
 
-async def poll_once() -> int:
+async def poll_pipeline_runs() -> int:
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(PipelineRun)
@@ -45,8 +46,9 @@ async def main() -> None:
     logger.info("AI Studio 360 worker started")
     while True:
         try:
-            n = await poll_once()
-            if n == 0:
+            summary_jobs = await poll_summary_jobs(limit=2)
+            pipeline_runs = await poll_pipeline_runs()
+            if summary_jobs == 0 and pipeline_runs == 0:
                 await asyncio.sleep(3)
         except Exception:  # noqa: BLE001
             logger.exception("Worker loop error")

@@ -104,6 +104,13 @@ export type ProjectSource = {
   summary_short_json: unknown;
   summary_structured_json: unknown;
   important_chunks_json: unknown;
+  summary_progress?: {
+    status?: string;
+    part_done?: number;
+    part_total?: number;
+    percent?: number;
+    message?: string;
+  };
   created_at: string;
   updated_at: string;
   has_parsed_text: boolean;

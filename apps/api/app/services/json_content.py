@@ -83,6 +83,17 @@ _SUMMARY_KEYS = (
 
 def extract_source_summary(payload: Any) -> dict[str, Any]:
     """Normalize a source-summary JSON payload into the stored field shape."""
+    if isinstance(payload, list):
+        return {
+            "brief_points": _as_list(payload),
+            "operations": [],
+            "skills": [],
+            "violations": [],
+            "visual_points": [],
+            "constraints": [],
+            "terms": [],
+            "important_fragments": [],
+        }
     data = _unwrap_summary_dict(payload)
     brief = _as_list(data.get("brief_points") if data else None) or _as_list(
         data.get("short") if data else None

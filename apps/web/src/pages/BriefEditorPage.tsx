@@ -25,6 +25,7 @@ export function BriefEditorPage() {
   const [approving, setApproving] = useState(false);
   const [message, setMessage] = useState("");
   const [uploading, setUploading] = useState(false);
+  const [busySourceId, setBusySourceId] = useState("");
   const [primaryId, setPrimaryId] = useState("");
   const [fallbackId, setFallbackId] = useState("");
   const [preview, setPreview] = useState<ProjectSource | null>(null);
@@ -150,14 +151,22 @@ export function BriefEditorPage() {
   }
 
   async function reprocess(id: string) {
-    await api(`/sources/${id}/reprocess`, {
-      method: "POST",
-      body: JSON.stringify({
-        primary_model_id: primaryId || null,
-        fallback_model_id: fallbackId || null,
-      }),
-    });
-    await reloadSources();
+    setBusySourceId(id);
+    setMessage("");
+    try {
+      await api(`/sources/${id}/reprocess`, {
+        method: "POST",
+        body: JSON.stringify({
+          primary_model_id: primaryId || null,
+          fallback_model_id: fallbackId || null,
+        }),
+      });
+      await reloadSources();
+    } catch (e) {
+      setMessage(`Пересобрать не удалось: ${e}`);
+    } finally {
+      setBusySourceId("");
+    }
   }
 
   async function removeSource(id: string, title: string) {
@@ -348,8 +357,13 @@ export function BriefEditorPage() {
                       <button type="button" className="btn-ghost" onClick={() => void showSource(s.id)}>
                         Выжимка
                       </button>
-                      <button type="button" className="btn-ghost" onClick={() => void reprocess(s.id)}>
-                        Пересобрать
+                      <button
+                        type="button"
+                        className="btn-ghost"
+                        disabled={busySourceId === s.id}
+                        onClick={() => void reprocess(s.id)}
+                      >
+                        {busySourceId === s.id ? "Собираем…" : "Пересобрать"}
                       </button>
                       <button
                         type="button"
@@ -475,8 +489,9 @@ function SourceSummaryHelp({
             <li>Файл сохраняется, из PDF / DOCX / TXT извлекается текст.</li>
             <li>Текст режется на фрагменты (~1100 символов с перекрытием 150) — они нужны для поиска, не для самой выжимки.</li>
             <li>
-              Модель получает системный промпт ниже и <b>первые 12&nbsp;000 символов</b> документа. Ответ ждут как JSON:
-              подробные пункты, операции, навыки, нарушения, визуальные точки, ограничения, термины и дословные цитаты.
+              Модель получает системный промпт ниже и <b>весь извлечённый текст</b> (длинный документ режется на части,
+              выжимки потом объединяются). Ответ ждут как JSON: пункты, операции, навыки, нарушения, визуальные точки,
+              ограничения, термины и дословные цитаты.
             </li>
             <li>
               В карту и сценарий потом уходит эта выжимка, а не весь файл. По запросу добавляются несколько найденных
@@ -491,16 +506,14 @@ function SourceSummaryHelp({
                 гадать по пикселям.
               </li>
               <li>
-                В модель на выжимку идёт не весь документ, а начало (~12k символов): полный файл часто не влезает в
-                окно и дороже. Длинный хвост остаётся в чанках и подтягивается поиском.
+                В модель на выжимку идёт весь извлечённый текст. Если файл длинный, он обрабатывается по частям, чтобы
+                не обрезать СОП и не терять нормы.
               </li>
               <li>
-                Карта/чат не получают сырой PDF целиком — только конспект и релевантные куски. Так экономим токены и
-                меньше смешиваем инструкции с данными.
+                Карта/чат не получают сырой PDF целиком — только готовую выжимку и релевантные фрагменты по запросу.
               </li>
               <li>
-                Если модель не ответила, берём первые строки файла как заглушку, чтобы загрузка не зависала. Тогда в
-                статусе будет пометка про выжимку без модели.
+                Если модель не ответила, статус будет ошибкой, а не пустой «успешной» выжимкой. Нажмите «Пересобрать».
               </li>
             </ul>
           </div>
@@ -539,7 +552,7 @@ function SourceSummaryHelp({
 Верни ТОЛЬКО JSON.
 
 === DOCUMENT TEXT ===
-<первые 12000 символов извлечённого текста>
+<извлечённый текст целиком; длинный файл — по частям>
 === END ===`}
                 </pre>
               </div>

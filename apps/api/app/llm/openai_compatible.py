@@ -114,21 +114,14 @@ class OpenAICompatibleProvider:
 
     async def generate(self, api_key: str, request: GenerateRequest) -> GenerateResult:
         url = f"{self.base_url}/chat/completions"
-        body: dict[str, Any] = {
-            "model": request.model,
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
-            "messages": [
-                {"role": "system", "content": request.system},
-                {"role": "user", "content": request.user},
-            ],
-        }
-        if request.response_json and self._supports_structured:
-            body["response_format"] = {"type": "json_object"}
-
+        body = _build_chat_body(self.base_url, request, self._supports_structured)
         started = time.perf_counter()
         async with httpx.AsyncClient(timeout=float(request.timeout_seconds)) as client:
             resp = await client.post(url, headers=self._headers(api_key), json=body)
+            if resp.status_code >= 400:
+                stripped = _strip_unsupported_fields(body, resp.text)
+                if stripped is not None:
+                    resp = await client.post(url, headers=self._headers(api_key), json=stripped)
             latency = int((time.perf_counter() - started) * 1000)
             if resp.status_code >= 400:
                 raise RuntimeError(f"{self.name} error {resp.status_code}: {resp.text[:500]}")
@@ -137,11 +130,9 @@ class OpenAICompatibleProvider:
         choices = data.get("choices") or (data.get("data") or {}).get("choices") or []
         choice = choices[0] if choices else {}
         message = choice.get("message") or choice.get("delta") or {}
-        content = _coerce_message_content(message)
-        if not content.strip():
-            content = _coerce_content_value(choice.get("text")) or _coerce_content_value(
-                choice.get("content")
-            )
+        content = _extract_completion_text(message, choice)
+        if request.assistant_prefill:
+            content = _apply_prefill(request.assistant_prefill, content)
         usage = data.get("usage") or {}
         if not content.strip():
             logger.warning(
@@ -180,26 +171,94 @@ class OpenAICompatibleProvider:
         return True
 
 
-def _coerce_message_content(message: dict[str, Any]) -> str:
-    """Read assistant answer; keep chain-of-thought separate from final content."""
+def _build_chat_body(base_url: str, request: GenerateRequest, supports_structured: bool) -> dict[str, Any]:
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": request.system},
+        {"role": "user", "content": request.user},
+    ]
+    if request.assistant_prefill:
+        messages.append({"role": "assistant", "content": request.assistant_prefill})
+    body: dict[str, Any] = {
+        "model": request.model,
+        "temperature": request.temperature,
+        "max_tokens": request.max_tokens,
+        "messages": messages,
+    }
+    if request.response_json and supports_structured:
+        body["response_format"] = {"type": "json_object"}
+    body.update(_thinking_off_extras(base_url, request.model))
+    if request.extra_body:
+        body.update(request.extra_body)
+    return body
+
+
+def _thinking_off_extras(base_url: str, model_id: str) -> dict[str, Any]:
+    """Disable chain-of-thought so the model spends tokens on the actual answer."""
+    blob = f"{base_url} {model_id}".lower()
+    extra: dict[str, Any] = {}
+    if "deepseek" in blob:
+        extra["thinking"] = {"type": "disabled"}
+    if "openrouter" in blob or "tsarrouter" in blob or "hubris" in blob:
+        extra["reasoning"] = {"effort": "none", "exclude": True}
+    return extra
+
+
+def _strip_unsupported_fields(body: dict[str, Any], error_text: str) -> dict[str, Any] | None:
+    """Retry without fields the gateway rejected (thinking / reasoning / json_object)."""
+    err = (error_text or "").lower()
+    stripped = dict(body)
+    changed = False
+    for key in ("thinking", "reasoning", "response_format"):
+        if key in stripped and (key in err or "unknown" in err or "invalid" in err or "not supported" in err):
+            stripped.pop(key, None)
+            changed = True
+    if not changed:
+        if "response_format" in stripped and ("json" in err or "format" in err):
+            stripped.pop("response_format", None)
+            changed = True
+        if "thinking" in stripped and ("thinking" in err or "reason" in err):
+            stripped.pop("thinking", None)
+            changed = True
+        if "reasoning" in stripped and ("reason" in err):
+            stripped.pop("reasoning", None)
+            changed = True
+    return stripped if changed else None
+
+
+def _apply_prefill(prefill: str, content: str) -> str:
+    text = (content or "").lstrip()
+    if not prefill:
+        return text
+    if text.startswith(prefill):
+        return text
+    if prefill == "{" and text.startswith('"'):
+        return "{" + text
+    return prefill + text
+
+
+def _extract_completion_text(message: dict[str, Any], choice: dict[str, Any]) -> str:
+    """Prefer JSON-looking text; otherwise concatenate content + reasoning."""
     if not isinstance(message, dict):
         return _coerce_content_value(message)
-
-    content = _coerce_content_value(message.get("content"))
-    if content.strip():
-        return content
-
-    for key in ("text", "output_text"):
-        text = _coerce_content_value(message.get(key))
-        if text.strip():
+    parts = [
+        _coerce_content_value(message.get("content")),
+        _coerce_content_value(message.get("text")),
+        _coerce_content_value(message.get("output_text")),
+        _coerce_content_value(message.get("reasoning_content")),
+        _coerce_content_value(message.get("reasoning")),
+        _coerce_content_value(message.get("reasoning_details")),
+        _coerce_content_value(choice.get("text")),
+        _coerce_content_value(choice.get("content")),
+    ]
+    nonempty = [p.strip() for p in parts if p and str(p).strip()]
+    for text in nonempty:
+        if "brief_points" in text or text.lstrip().startswith("{") or "```json" in text.lower():
             return text
+    return "\n".join(nonempty)
 
-    # Some providers put JSON only in reasoning fields when content is empty.
-    for key in ("reasoning_content", "reasoning", "reasoning_details"):
-        text = _coerce_content_value(message.get(key))
-        if text.strip() and ("brief_points" in text or text.lstrip().startswith("{")):
-            return text
-    return ""
+
+def _coerce_message_content(message: dict[str, Any]) -> str:
+    return _extract_completion_text(message if isinstance(message, dict) else {}, {})
 
 
 def _coerce_content_value(value: Any) -> str:

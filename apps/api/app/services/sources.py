@@ -344,7 +344,7 @@ async def summarize_source(
     from app.services.prompt_assembler import get_active_system_template
 
     template = await get_active_system_template(db, "source_summary")
-    system = template.content if template else SOURCE_SUMMARY_PROMPT
+    system = (template.content if template else SOURCE_SUMMARY_PROMPT) + STRICT_JSON_INSTRUCTION
     primary, fallback = await _resolve_models(
         db, user_id, source.project_id, "source_summary", primary_model_id, fallback_model_id
     )
@@ -487,16 +487,24 @@ async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any
             f"(вход ~{input_tokens} токенов, лимит запроса {_request_token_budget(model)})"
         )
 
-    # json_object first — forces valid JSON on OpenAI-compatible / DeepSeek / Groq providers.
+    # json_object + thinking off; then continue from "{" if the model still rambles.
     attempts: list[tuple[dict[str, Any], dict[str, Any] | None]] = [
         ({"response_json": True, "max_tokens": min(max_out, 4096), "timeout_seconds": 180}, None),
-        ({"response_json": False, "max_tokens": max_out, "timeout_seconds": 180}, None),
         (
-            {"response_json": True, "max_tokens": min(max_out, 4096), "timeout_seconds": 180},
+            {
+                "response_json": True,
+                "max_tokens": min(max_out, 4096),
+                "timeout_seconds": 180,
+                "assistant_prefill": "{",
+            },
+            None,
+        ),
+        (
+            {"response_json": False, "max_tokens": max_out, "timeout_seconds": 180, "assistant_prefill": "{"},
             {
                 "system_prompt": assembled["system_prompt"] + STRICT_JSON_INSTRUCTION,
                 "user_message": assembled["user_message"]
-                + "\n\nПовтор: верни ТОЛЬКО JSON-объект без текста до и после.",
+                + "\n\nПовтор: верни ТОЛЬКО JSON-объект. Начни с { и закончи }.",
             },
         ),
     ]
@@ -603,12 +611,12 @@ def _summary_user_message(
         "Проанализируй только текст между маркерами.\n"
         "Сохраняй критические детали: числа, единицы измерения, сроки, роли, последовательности действий, "
         "условия, исключения, запреты, критерии проверки и основания для нарушений.\n"
-        "Не объединяй разные нормы в один общий пункт.\n"
-        "Все поля JSON — массивы строк (не объекты). Ключи строго на английском: "
-        "brief_points, operations, skills, violations, visual_points, constraints, terms, important_fragments.\n"
-        "Не пиши рассуждения и план — только JSON. Первый символ ответа: {.\n"
-        "Верни ТОЛЬКО JSON.\n\n"
-        f"=== DOCUMENT TEXT ===\n{text}\n=== END ==="
+        "Не объединяй разные нормы в один общий пункт.\n\n"
+        f"=== DOCUMENT TEXT ===\n{text}\n=== END ===\n\n"
+        "Ответ: один JSON-объект. Ключи строго: "
+        "brief_points, operations, skills, violations, visual_points, constraints, terms, important_fragments. "
+        "Каждое поле — массив строк. Без markdown, без рассуждений, без текста до и после JSON. "
+        "Первый символ: { последний: }."
     )
 
 

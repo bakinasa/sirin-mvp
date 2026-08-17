@@ -27,6 +27,8 @@ class GenerateRequest:
     max_tokens: int = 4096
     response_json: bool = True
     timeout_seconds: int = 120
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    assistant_prefill: str = ""
 
 
 @dataclass

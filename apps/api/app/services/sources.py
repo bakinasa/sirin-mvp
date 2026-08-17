@@ -32,6 +32,11 @@ SUMMARY_PARALLEL_PARTS = 3
 GROQ_REQUEST_TOKEN_BUDGET = 11000
 CHARS_PER_TOKEN = 2.4
 
+STRICT_JSON_INSTRUCTION = (
+    "\n\nКРИТИЧНО: не пиши рассуждения, план, chain-of-thought, пояснения до или после JSON. "
+    "Первый символ ответа — «{», последний — «}». Только один JSON-объект."
+)
+
 SOURCE_SUMMARY_PROMPT = """Ты выполняешь высокоточную выжимку документа по профессии, операции, инструкции, процедуре или нормативным требованиям.
 
 Твоя цель — сократить текст без потери существенного смысла. Приоритет: полнота критически важной информации выше краткости. Ты не пишешь свободное резюме; ты извлекаешь опорные факты из текста.
@@ -470,9 +475,8 @@ async def _summarize_part_with_models(
 async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any]:
     from app.services.generation import _call_model
     from app.services.json_content import (
-        extract_source_summary,
-        parse_summary_json_content,
-        summary_has_content,
+        looks_like_reasoning_only,
+        try_parse_summary_from_text,
     )
 
     input_tokens = _estimate_tokens(assembled["system_prompt"] + "\n" + assembled["user_message"])
@@ -483,14 +487,24 @@ async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any
             f"(вход ~{input_tokens} токенов, лимит запроса {_request_token_budget(model)})"
         )
 
-    attempts = (
-        {"response_json": False, "max_tokens": max_out, "timeout_seconds": 180},
-        {"response_json": True, "max_tokens": min(max_out, 4096), "timeout_seconds": 180},
-    )
+    # json_object first — forces valid JSON on OpenAI-compatible / DeepSeek / Groq providers.
+    attempts: list[tuple[dict[str, Any], dict[str, Any] | None]] = [
+        ({"response_json": True, "max_tokens": min(max_out, 4096), "timeout_seconds": 180}, None),
+        ({"response_json": False, "max_tokens": max_out, "timeout_seconds": 180}, None),
+        (
+            {"response_json": True, "max_tokens": min(max_out, 4096), "timeout_seconds": 180},
+            {
+                "system_prompt": assembled["system_prompt"] + STRICT_JSON_INSTRUCTION,
+                "user_message": assembled["user_message"]
+                + "\n\nПовтор: верни ТОЛЬКО JSON-объект без текста до и после.",
+            },
+        ),
+    ]
     errors: list[str] = []
-    for kwargs in attempts:
+    for kwargs, prompt_override in attempts:
+        payload = prompt_override or assembled
         try:
-            result = await _call_model(db, model, assembled, "source_summary", **kwargs)
+            result = await _call_model(db, model, payload, "source_summary", **kwargs)
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
             if _is_request_too_large(exc):
@@ -508,11 +522,15 @@ async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any
                 f"{', finish=' + finish if finish else ''})"
             )
             continue
-        summary = extract_source_summary(parse_summary_json_content(content))
-        if not summary_has_content(summary):
-            summary = extract_source_summary(content)
-        if summary_has_content(summary):
+
+        summary = try_parse_summary_from_text(content)
+        if summary:
             return summary
+
+        if looks_like_reasoning_only(content):
+            errors.append("модель вернула рассуждение вместо JSON")
+            continue
+
         preview = content[:500].replace("\n", " ").strip()
         errors.append(f"ответ модели не разобрался как JSON выжимки: {preview}")
     raise RuntimeError("; ".join(errors) or "не удалось получить выжимку")
@@ -588,6 +606,7 @@ def _summary_user_message(
         "Не объединяй разные нормы в один общий пункт.\n"
         "Все поля JSON — массивы строк (не объекты). Ключи строго на английском: "
         "brief_points, operations, skills, violations, visual_points, constraints, terms, important_fragments.\n"
+        "Не пиши рассуждения и план — только JSON. Первый символ ответа: {.\n"
         "Верни ТОЛЬКО JSON.\n\n"
         f"=== DOCUMENT TEXT ===\n{text}\n=== END ==="
     )

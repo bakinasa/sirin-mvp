@@ -137,11 +137,11 @@ class OpenAICompatibleProvider:
         choices = data.get("choices") or (data.get("data") or {}).get("choices") or []
         choice = choices[0] if choices else {}
         message = choice.get("message") or choice.get("delta") or {}
-        content = _prefer_jsonish(
-            _coerce_message_content(message),
-            _coerce_content_value(choice.get("text")),
-            _coerce_content_value(choice.get("content")),
-        )
+        content = _coerce_message_content(message)
+        if not content.strip():
+            content = _coerce_content_value(choice.get("text")) or _coerce_content_value(
+                choice.get("content")
+            )
         usage = data.get("usage") or {}
         if not content.strip():
             logger.warning(
@@ -181,29 +181,25 @@ class OpenAICompatibleProvider:
 
 
 def _coerce_message_content(message: dict[str, Any]) -> str:
-    """Read assistant text from OpenAI, DeepSeek and multipart payloads."""
+    """Read assistant answer; keep chain-of-thought separate from final content."""
     if not isinstance(message, dict):
         return _coerce_content_value(message)
-    texts = [
-        _coerce_content_value(message.get(key))
-        for key in (
-            "content",
-            "reasoning_content",
-            "reasoning",
-            "text",
-            "output_text",
-            "reasoning_details",
-        )
-    ]
-    return _prefer_jsonish(*texts)
 
+    content = _coerce_content_value(message.get("content"))
+    if content.strip():
+        return content
 
-def _prefer_jsonish(*texts: str) -> str:
-    candidates = [text.strip() for text in texts if text and str(text).strip()]
-    for text in candidates:
-        if "brief_points" in text or text.startswith("{") or text.startswith("```"):
+    for key in ("text", "output_text"):
+        text = _coerce_content_value(message.get(key))
+        if text.strip():
             return text
-    return candidates[0] if candidates else ""
+
+    # Some providers put JSON only in reasoning fields when content is empty.
+    for key in ("reasoning_content", "reasoning", "reasoning_details"):
+        text = _coerce_content_value(message.get(key))
+        if text.strip() and ("brief_points" in text or text.lstrip().startswith("{")):
+            return text
+    return ""
 
 
 def _coerce_content_value(value: Any) -> str:

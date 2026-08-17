@@ -17,6 +17,46 @@ def parse_summary_json_content(text: str) -> Any:
     return _parse_json_candidates(text, prefer_summary=True)
 
 
+def try_parse_summary_from_text(text: str) -> dict[str, Any] | None:
+    """Return normalized summary dict if any JSON block in text is valid."""
+    summary = extract_source_summary(parse_summary_json_content(text))
+    if summary_has_content(summary):
+        return summary
+    return None
+
+
+def looks_like_reasoning_only(text: str) -> bool:
+    """Heuristic: model returned chain-of-thought instead of JSON."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if stripped.startswith("{") or stripped.startswith("```"):
+        return False
+    if try_parse_summary_from_text(stripped):
+        return False
+    lower = stripped.lower()
+    markers = (
+        "мы должны",
+        "нужно вернуть",
+        "need to",
+        "we need",
+        "we must",
+        "let's",
+        "let us",
+        "i need to",
+        "i will",
+        "thinking",
+        "analyze text",
+        "проанализировать",
+        "выделить факты",
+        "json schema",
+        "need produce",
+        "need adhere",
+        "need parse",
+    )
+    return any(marker in lower for marker in markers)
+
+
 def _parse_json_candidates(text: str, *, prefer_summary: bool) -> Any:
     text = (text or "").strip()
     if not text:
@@ -60,11 +100,20 @@ def _collect_json_candidates(text: str) -> list[str]:
 
     add(text)
     add(_extract_from_markdown_fences(text))
-    add(_extract_balanced_object(text))
 
-    repaired = _repair_truncated_json(_extract_balanced_object(text) or text)
-    if repaired:
-        add(repaired)
+    # Reasoning models often append JSON after prose — try all objects, newest first.
+    objects = _extract_all_balanced_objects(text)
+    for obj in reversed(objects):
+        add(obj)
+        repaired = _repair_truncated_json(obj)
+        if repaired:
+            add(repaired)
+
+    if not objects:
+        add(_extract_balanced_object(text))
+        repaired = _repair_truncated_json(_extract_balanced_object(text) or text)
+        if repaired:
+            add(repaired)
 
     return candidates
 
@@ -389,6 +438,12 @@ def _extract_balanced_object(text: str) -> str:
     start = text.find("{")
     if start < 0:
         return ""
+    return _extract_balanced_object_from(text, start)
+
+
+def _extract_balanced_object_from(text: str, start: int) -> str:
+    if start < 0 or start >= len(text) or text[start] != "{":
+        return ""
     depth = 0
     in_string = False
     escape = False
@@ -411,6 +466,23 @@ def _extract_balanced_object(text: str) -> str:
             if depth == 0:
                 return text[start : i + 1]
     return text[start:]
+
+
+def _extract_all_balanced_objects(text: str) -> list[str]:
+    objects: list[str] = []
+    start = 0
+    while start < len(text):
+        idx = text.find("{", start)
+        if idx < 0:
+            break
+        obj = _extract_balanced_object_from(text, idx)
+        if not obj or obj == "{":
+            start = idx + 1
+            continue
+        if obj not in objects:
+            objects.append(obj)
+        start = idx + max(len(obj), 1)
+    return objects
 
 
 def _repair_truncated_json(text: str) -> str | None:

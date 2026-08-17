@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import time
 from typing import Any, Optional
 
 import httpx
 
 from app.llm.base import CostEstimate, GenerateRequest, GenerateResult, ModelInfo
+
+logger = logging.getLogger(__name__)
 
 
 class OpenAICompatibleProvider:
@@ -130,11 +134,24 @@ class OpenAICompatibleProvider:
                 raise RuntimeError(f"{self.name} error {resp.status_code}: {resp.text[:500]}")
             data = resp.json()
 
-        content = ""
-        choices = data.get("choices") or []
-        if choices:
-            content = (choices[0].get("message") or {}).get("content") or ""
+        choices = data.get("choices") or (data.get("data") or {}).get("choices") or []
+        choice = choices[0] if choices else {}
+        message = choice.get("message") or choice.get("delta") or {}
+        content = _prefer_jsonish(
+            _coerce_message_content(message),
+            _coerce_content_value(choice.get("text")),
+            _coerce_content_value(choice.get("content")),
+        )
         usage = data.get("usage") or {}
+        if not content.strip():
+            logger.warning(
+                "Empty LLM content model=%s finish=%s tokens_in=%s tokens_out=%s message_keys=%s",
+                request.model,
+                choice.get("finish_reason") or choice.get("native_finish_reason"),
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                list(message.keys()) if isinstance(message, dict) else type(message).__name__,
+            )
         return GenerateResult(
             content=content,
             raw=data,
@@ -161,6 +178,72 @@ class OpenAICompatibleProvider:
 
     def supports_fallback(self) -> bool:
         return True
+
+
+def _coerce_message_content(message: dict[str, Any]) -> str:
+    """Read assistant text from OpenAI, DeepSeek and multipart payloads."""
+    if not isinstance(message, dict):
+        return _coerce_content_value(message)
+    texts = [
+        _coerce_content_value(message.get(key))
+        for key in (
+            "content",
+            "reasoning_content",
+            "reasoning",
+            "text",
+            "output_text",
+            "reasoning_details",
+        )
+    ]
+    return _prefer_jsonish(*texts)
+
+
+def _prefer_jsonish(*texts: str) -> str:
+    candidates = [text.strip() for text in texts if text and str(text).strip()]
+    for text in candidates:
+        if "brief_points" in text or text.startswith("{") or text.startswith("```"):
+            return text
+    return candidates[0] if candidates else ""
+
+
+def _coerce_content_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                parts.append(
+                    _coerce_content_value(
+                        item.get("text")
+                        or item.get("content")
+                        or item.get("reasoning")
+                        or item.get("output_text")
+                        or item.get("summary")
+                    )
+                )
+        return "".join(parts)
+    if isinstance(value, dict):
+        if any(key in value for key in ("brief_points", "sections", "short")):
+            return json.dumps(value, ensure_ascii=False)
+        for key in ("text", "content", "reasoning", "output_text", "summary"):
+            inner = value.get(key)
+            if inner:
+                text = _coerce_content_value(inner)
+                if text.strip():
+                    return text
+        for key in ("parts", "reasoning_details"):
+            inner = value.get(key)
+            if inner:
+                text = _coerce_content_value(inner)
+                if text.strip():
+                    return text
+        return ""
+    return str(value)
 
 
 def _price(value: Any) -> Optional[float]:

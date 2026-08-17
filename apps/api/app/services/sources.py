@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import uuid
 from typing import Any, Optional
@@ -271,7 +272,7 @@ async def process_source(
         await db.refresh(source)
         return source
 
-    chunk_objs = await _replace_chunks(db, source, chunk_text(text))
+    await _replace_chunks(db, source, chunk_text(text))
 
     source.parse_status = ParseStatus.SUMMARIZING.value
     await db.flush()
@@ -280,16 +281,14 @@ async def process_source(
             db, source, user_id, primary_model_id, fallback_model_id
         )
         source.parse_status = ParseStatus.READY.value
+        source.parse_error = ""
     except Exception as exc:  # noqa: BLE001
         logger.warning("Summary failed for source %s: %s", source.id, exc)
-        source.summary_short_json = _fallback_short_summary(text)
-        source.summary_structured_json = {"note": "Выжимка без модели", "excerpt": text[:1500]}
-        source.important_chunks_json = [
-            {"text": c.text[:400], "page_ref": c.page_ref}
-            for c in chunk_objs[:5]
-        ]
-        source.parse_status = ParseStatus.READY.value
-        source.parse_error = f"Выжимка по заглушке: {exc}"
+        source.parse_status = ParseStatus.FAILED.value
+        source.parse_error = f"Выжимка не удалась: {exc}"
+        source.summary_short_json = []
+        source.summary_structured_json = {}
+        source.important_chunks_json = []
     await db.flush()
     await db.refresh(source)
     return source
@@ -319,61 +318,164 @@ async def summarize_source(
     primary_model_id: Optional[UUID] = None,
     fallback_model_id: Optional[UUID] = None,
 ) -> None:
-    from app.services.generation import _call_model, _parse_json_content, _resolve_models
-    from app.services.json_content import extract_source_summary, summary_has_content
+    from app.services.generation import _resolve_models
+    from app.services.json_content import summary_has_content
     from app.services.prompt_assembler import get_active_system_template
 
     template = await get_active_system_template(db, "source_summary")
     system = template.content if template else SOURCE_SUMMARY_PROMPT
-    excerpt = source.parsed_text[:12000]
-    assembled = {
-        "system_prompt": system,
-        "user_message": (
-            f"Файл: {source.title}\n"
-            f"Тип: {source.source_type}\n\n"
-            "Проанализируй только текст между маркерами.\n"
-            "Если текст выглядит обрезанным, неполным или начинается/заканчивается на середине мысли, "
-            "отрази это в constraints.\n"
-            "Сохраняй критические детали: числа, единицы измерения, сроки, роли, последовательности действий, "
-            "условия, исключения, запреты, критерии проверки и основания для нарушений.\n"
-            "Не объединяй разные нормы в один общий пункт.\n"
-            "Верни ТОЛЬКО JSON.\n\n"
-            f"=== DOCUMENT TEXT ===\n{excerpt}\n=== END ==="
-        ),
-    }
     primary, fallback = await _resolve_models(
         db, user_id, source.project_id, "source_summary", primary_model_id, fallback_model_id
     )
-    result = None
+    models = [m for m in (primary, fallback) if m is not None]
+    if not models:
+        raise RuntimeError("Нет доступной модели для выжимки. Добавьте модель на странице «Модели».")
+
+    parts = _split_for_summary(source.parsed_text or "")
+    part_summaries: list[dict[str, Any]] = []
     last_error = ""
-    for model in (primary, fallback):
-        if model is None:
-            continue
-        try:
-            result = await _call_model(db, model, assembled, "source_summary")
-            break
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-    if result is None:
-        raise RuntimeError(last_error or "no model")
-    payload = _parse_json_content(result.content)
-    summary = extract_source_summary(payload)
-    if not summary_has_content(summary):
-        raise RuntimeError(
-            "Модель вернула пустую выжимку или ответ не разобрался как JSON. "
-            f"Сырой ответ: {(result.content or '')[:400]}"
-        )
-    source.summary_short_json = summary["brief_points"]
+    for index, part in enumerate(parts):
+        assembled = {
+            "system_prompt": system,
+            "user_message": _summary_user_message(
+                source.title,
+                source.source_type,
+                part,
+                part_index=index,
+                part_count=len(parts),
+            ),
+        }
+        summary = None
+        for model in models:
+            try:
+                summary = await _summarize_once(db, model, assembled)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = str(exc)
+                logger.warning("Summary call failed (%s part %s): %s", model.model_id, index + 1, exc)
+        if not summary:
+            raise RuntimeError(last_error or "Модель вернула пустой ответ на выжимку")
+        part_summaries.append(summary)
+
+    merged = _merge_summaries(part_summaries)
+    if not summary_has_content(merged):
+        raise RuntimeError("После объединения частей выжимка всё ещё пустая")
+
+    source.summary_short_json = merged["brief_points"]
     source.summary_structured_json = {
-        "operations": summary["operations"],
-        "skills": summary["skills"],
-        "violations": summary["violations"],
-        "visual_points": summary["visual_points"],
-        "constraints": summary["constraints"],
-        "terms": summary["terms"],
+        "operations": merged["operations"],
+        "skills": merged["skills"],
+        "violations": merged["violations"],
+        "visual_points": merged["visual_points"],
+        "constraints": merged["constraints"],
+        "terms": merged["terms"],
     }
-    source.important_chunks_json = summary["important_fragments"]
+    source.important_chunks_json = merged["important_fragments"]
     source.parse_error = ""
+
+
+async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any]:
+    from app.services.generation import _call_model, _parse_json_content
+    from app.services.json_content import extract_source_summary, summary_has_content
+
+    attempts = (
+        {"response_json": False, "max_tokens": 16384, "timeout_seconds": 240},
+        {"response_json": True, "max_tokens": 8192, "timeout_seconds": 240},
+    )
+    errors: list[str] = []
+    for kwargs in attempts:
+        try:
+            result = await _call_model(db, model, assembled, "source_summary", **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+            continue
+        content = (result.content or "").strip()
+        if not content:
+            finish = ""
+            raw = result.raw or {}
+            choices = raw.get("choices") or []
+            if choices:
+                finish = str(choices[0].get("finish_reason") or "")
+            errors.append(
+                f"пустой ответ модели (tokens {result.token_input}/{result.token_output}"
+                f"{', finish=' + finish if finish else ''})"
+            )
+            continue
+        summary = extract_source_summary(_parse_json_content(content))
+        if not summary_has_content(summary):
+            summary = extract_source_summary(content)
+        if summary_has_content(summary):
+            return summary
+        errors.append("ответ модели не разобрался как JSON выжимки")
+    raise RuntimeError("; ".join(errors) or "не удалось получить выжимку")
+
+
+def _summary_user_message(
+    title: str,
+    source_type: str,
+    text: str,
+    *,
+    part_index: int,
+    part_count: int,
+) -> str:
+    part_note = ""
+    if part_count > 1:
+        part_note = (
+            f"Это часть {part_index + 1} из {part_count} документа. "
+            "Сделай выжимку этой части; не пиши, что данных нет, если в части есть факты.\n\n"
+        )
+    return (
+        f"Файл: {title}\n"
+        f"Тип: {source_type}\n\n"
+        f"{part_note}"
+        "Проанализируй только текст между маркерами.\n"
+        "Сохраняй критические детали: числа, единицы измерения, сроки, роли, последовательности действий, "
+        "условия, исключения, запреты, критерии проверки и основания для нарушений.\n"
+        "Не объединяй разные нормы в один общий пункт.\n"
+        "Верни ТОЛЬКО JSON.\n\n"
+        f"=== DOCUMENT TEXT ===\n{text}\n=== END ==="
+    )
+
+
+def _split_for_summary(text: str, size: int = 24000, overlap: int = 600) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= size:
+        return [text]
+    parts: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + size)
+        parts.append(text[start:end])
+        if end >= len(text):
+            break
+        start = end - overlap
+    return parts
+
+
+def _merge_summaries(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    keys = (
+        "brief_points",
+        "operations",
+        "skills",
+        "violations",
+        "visual_points",
+        "constraints",
+        "terms",
+        "important_fragments",
+    )
+    merged = {key: [] for key in keys}
+    seen = {key: set() for key in keys}
+    for part in parts:
+        for key in keys:
+            for item in part.get(key) or []:
+                marker = item.strip() if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+                if not marker or marker in seen[key]:
+                    continue
+                seen[key].add(marker)
+                merged[key].append(item)
+    return merged
 
 
 async def search_chunks(
@@ -480,11 +582,6 @@ async def _replace_chunks(
     db.add_all(objects)
     await db.flush()
     return objects
-
-
-def _fallback_short_summary(text: str) -> list[str]:
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    return lines[:8] or ["Текст извлечён, но выжимка не построена."]
 
 
 def _safe_filename(name: str) -> str:

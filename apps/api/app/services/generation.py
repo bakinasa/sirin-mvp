@@ -188,7 +188,16 @@ async def execute_run(db: AsyncSession, run_id: UUID) -> PipelineRun:
     return run
 
 
-async def _call_model(db: AsyncSession, model: UserModel, assembled: dict, step_type: str = ""):
+async def _call_model(
+    db: AsyncSession,
+    model: UserModel,
+    assembled: dict,
+    step_type: str = "",
+    *,
+    response_json: bool = True,
+    timeout_seconds: int | None = None,
+    max_tokens: int | None = None,
+):
     # UserModel stores the full upstream connection config + encrypted BYOK.
     api_key = decrypt_secret(model.encrypted_api_key)
     if not api_key:
@@ -197,23 +206,25 @@ async def _call_model(db: AsyncSession, model: UserModel, assembled: dict, step_
     adapter = build_provider(
         model.provider_type, model.provider_name, model.base_url, model.capabilities_json
     )
-    max_tokens = (
-        8192
-        if step_type
-        in (
-            StepType.PROFESSION_MAP.value,
-            StepType.SCENARIO_PLAN.value,
-            "source_summary",
+    if max_tokens is None:
+        max_tokens = (
+            8192
+            if step_type
+            in (
+                StepType.PROFESSION_MAP.value,
+                StepType.SCENARIO_PLAN.value,
+                "source_summary",
+            )
+            else 4096
         )
-        else 4096
-    )
     req = GenerateRequest(
         model=model.model_id,
         system=assembled["system_prompt"],
         user=assembled["user_message"],
         temperature=0.2,
         max_tokens=max_tokens,
-        response_json=True,
+        response_json=response_json,
+        timeout_seconds=timeout_seconds or 120,
     )
     return await adapter.generate(api_key, req)
 

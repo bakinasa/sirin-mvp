@@ -13,7 +13,7 @@ from app.services.sources import (
     create_source_from_upload,
     delete_source,
     list_sources,
-    process_source,
+    reprocess_source,
     source_to_out,
 )
 
@@ -94,6 +94,14 @@ async def reprocess(
     source = result.scalar_one_or_none()
     if source is None:
         raise HTTPException(404, "Source not found")
+    payload = body or SourceReprocessIn()
+    source = await reprocess_source(
+        db,
+        source,
+        user.id,
+        primary_model_id=payload.primary_model_id,
+        fallback_model_id=payload.fallback_model_id,
+    )
     return SourceOut.model_validate(source_to_out(source))
 
 

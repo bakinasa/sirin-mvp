@@ -12,6 +12,10 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services.source_jobs import build_summary_job, summary_progress
+from app.services.json_content import (
+    looks_like_reasoning_only,
+    try_parse_summary_from_text,
+)
 from app.services.sources import (
     SUMMARY_PART_SIZE,
     _is_request_too_large,
@@ -21,6 +25,25 @@ from app.services.sources import (
     _split_for_summary,
     summarize_source,
 )
+
+
+class ReasoningParseTests(unittest.TestCase):
+    def test_json_after_reasoning_prose(self):
+        text = (
+            "Мы должны проанализировать текст и вернуть JSON.\n\n"
+            '{"brief_points": ["Пункт 1"], "operations": ["Шаг 1"], '
+            '"skills": [], "violations": [], "visual_points": [], '
+            '"constraints": [], "terms": [], "important_fragments": []}'
+        )
+        summary = try_parse_summary_from_text(text)
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary["brief_points"], ["Пункт 1"])
+
+    def test_reasoning_only_detected(self):
+        text = "We need answer JSON only. Need analyze text between markers. Need produce fields."
+        self.assertTrue(looks_like_reasoning_only(text))
+        self.assertIsNone(try_parse_summary_from_text(text))
 
 
 class TokenBudgetTests(unittest.TestCase):

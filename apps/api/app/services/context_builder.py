@@ -142,7 +142,7 @@ async def build_context_bundle(
                 {
                     "id": "profession_map",
                     "kind": "approved_artifact",
-                    "title": "Карта профессии (основа сценария)",
+                    "title": "Сюжет и точки оценки (основа сценария)",
                     "version": pm.version,
                     "content": pm.content,
                 }

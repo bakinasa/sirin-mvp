@@ -208,7 +208,7 @@ async def new_map_edition(db: AsyncSession, project_id: UUID) -> dict:
     """Unlock profession_map and mark scenario_plan as outdated."""
     map_step = await _get_step(db, project_id, StepType.PROFESSION_MAP.value)
     if map_step is None:
-        raise StageEditError("Карта профессии не найдена")
+        raise StageEditError("Сюжет и точки оценки не найдены")
     map_step.status = StepStatus.UNDER_REVIEW.value
     if map_step.current_artifact_id:
         art = await db.get(Artifact, map_step.current_artifact_id)

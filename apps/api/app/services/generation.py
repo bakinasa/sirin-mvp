@@ -504,29 +504,33 @@ def _mock_artifact(step_type: str, assembled: dict, reason: str = "") -> dict:
         doc = {
             "sections": [
                 {
-                    "id": "work_type",
-                    "title": "Вид работ для оценки",
+                    "id": "work_variants",
+                    "title": "Варианты работ для оценки",
                     "items": [
                         {
-                            "id": "work_type_1",
+                            "id": "work_1",
                             "title": topic,
-                            "description": work_ctx or f"Вид работ по проекту «{title}»",
-                            "why": "Собрано из brief без вызова модели",
-                            "in_scope": [topic],
-                            "out_of_scope": [],
-                            "sources": [],
+                            "description": work_ctx or f"Операция по проекту «{title}»",
+                            "why_selected": "Собрано из brief без вызова модели",
+                            "priority": "high",
+                            "process_overview": ["Подготовка", "Основная работа", "Завершение"],
+                            "likely_location": work_ctx or "рабочая площадка",
+                            "required_objects": [x for x in [tools] if x],
+                            "main_risks": [x for x in [safety] if x],
                             "status": "proposed",
                         }
                     ],
                 },
                 {
-                    "id": "skills",
+                    "id": "evaluated_skills",
                     "title": "Оцениваемые навыки",
                     "items": [
                         {
                             "id": "skill_1",
                             "title": "Безопасное выполнение операции",
-                            "description": f"Базовый навык для: {topic}",
+                            "description": f"Наблюдаемый навык для: {topic}",
+                            "related_work_ids": ["work_1"],
+                            "observable_result": "Действия выполняются в регламентном порядке",
                             "criticality": "high",
                             "status": "proposed",
                         }
@@ -538,33 +542,48 @@ def _mock_artifact(step_type: str, assembled: dict, reason: str = "") -> dict:
                     "items": [
                         {
                             "id": "point_1",
-                            "skill_id": "skill_1",
                             "title": "Соблюдение порядка действий",
-                            "observe": "Последовательность операций в кадре",
-                            "correct": "Действия по регламенту",
-                            "violation": "Пропуск шага или нарушение порядка",
-                            "visual": "средняя",
-                            "can_360": True,
+                            "description": "Проверяется последовательность операций в кадре",
+                            "skill_id": "skill_1",
+                            "related_work_ids": ["work_1"],
+                            "correct_observation": "Действия по регламенту",
+                            "error_observation": "Пропуск шага или нарушение порядка",
+                            "visual_cues": ["Порядок действий виден в кадре"],
+                            "violation_category": "порядок работ",
                             "status": "proposed",
                         }
                     ],
                 },
-                {"id": "errors", "title": "Частые ошибки", "items": []},
-                {"id": "segment_ideas", "title": "Идеи видеосегментов", "items": []},
-                {"id": "contradictions", "title": "Противоречия и пробелы", "items": []},
+                {
+                    "id": "preliminary_storylines",
+                    "title": "Предварительный сюжет",
+                    "items": [
+                        {
+                            "id": "story_1",
+                            "title": topic,
+                            "related_work_id": "work_1",
+                            "description": f"Укрупнённый сюжет по работе: {topic}",
+                            "story_steps": ["Подготовка", "Основная работа", "Завершение"],
+                            "training_focus": ["Правильное выполнение этапов"],
+                            "diagnostic_focus": [pains or "Типовое нарушение порядка"],
+                            "candidate_scene_groups": ["подготовка", "основная работа", "завершение"],
+                            "status": "proposed",
+                        }
+                    ],
+                },
                 {
                     "id": "expert_questions",
-                    "title": "Вопросы для экспертов",
+                    "title": "Вопросы экспертам",
                     "items": [
                         {
                             "id": "q_1",
                             "title": "Какие нарушения эксперты считают критичными?",
-                            "why": "В brief недостаточно данных",
+                            "description": "Нужно уточнить наблюдаемые ошибки для диагностики",
+                            "why_needed": "В brief недостаточно данных для сцен ошибок",
                             "status": "proposed",
                         }
                     ],
                 },
-                {"id": "shooting_constraints", "title": "Ограничения для съёмки", "items": []},
             ]
         }
         return {**ensure_ids(doc, "profession_map"), **{k: base[k] for k in ("_mock", "_generation", "title")}}
@@ -575,58 +594,65 @@ def _mock_artifact(step_type: str, assembled: dict, reason: str = "") -> dict:
         doc = {
             "sections": [
                 {
-                    "id": "passport",
+                    "id": "scenario_passport",
                     "title": "Паспорт сценария",
                     "items": [
                         {
                             "id": "passport_1",
                             "title": title,
-                            "profession": profession,
-                            "operation": topic,
-                            "format": meta.get("delivery_format") or "VR / планшет",
-                            "goal": brief.get("learning_objectives") or "",
+                            "description": f"Модуль по операции: {topic}. Режимы: обучение и диагностика.",
                             "status": "proposed",
                         }
                     ],
                 },
                 {
-                    "id": "training_mode",
-                    "title": "Режим «Обучение»",
+                    "id": "training_scenes",
+                    "title": "Режим обучения",
                     "items": [
                         {
-                            "id": "train_seg_1",
+                            "id": "train_1",
+                            "scene_no": 1,
                             "title": "Правильное выполнение",
+                            "description": f"Показать корректное выполнение: {topic}",
                             "location": work_ctx or "рабочая площадка",
-                            "frames": [
-                                {
-                                    "id": "tf_1",
-                                    "action": f"Показать корректное выполнение: {topic}",
-                                    "focus": "Ключевые действия и СИЗ",
-                                }
-                            ],
+                            "actors": ["исполнитель"],
+                            "actions": [f"Выполнить {topic} по регламенту"],
+                            "visual_accents": ["Ключевые действия и СИЗ"],
+                            "audio_text": f"Начните с осмотра зоны для: {topic}",
+                            "on_screen_training_texts": ["Соблюдайте порядок действий"],
+                            "linked_skill_ids": ["skill_1"],
+                            "linked_assessment_point_ids": ["point_1"],
                             "status": "proposed",
                         }
                     ],
                 },
                 {
-                    "id": "diagnostic_mode",
-                    "title": "Режим «Диагностика»",
+                    "id": "diagnostic_scenes",
+                    "title": "Режим диагностики",
                     "items": [
                         {
-                            "id": "diag_seg_1",
+                            "id": "diag_1",
+                            "scene_no": 1,
                             "title": "Поиск нарушений",
-                            "violation": pains or "Типовое нарушение порядка",
-                            "stop_at": "момент, когда нарушение видно в кадре",
-                            "assessment_points": ["point_1"],
+                            "description": "На том же этапе работы актёр допускает наблюдаемую ошибку",
+                            "location": work_ctx or "рабочая площадка",
+                            "actors": ["исполнитель"],
+                            "staged_errors": [pains or "Типовое нарушение порядка"],
+                            "error_categories": ["порядок работ"],
+                            "visual_accents": ["Момент, когда нарушение видно в кадре"],
+                            "audio_text": "",
+                            "on_screen_error_texts": ["Нарушен порядок действий"],
+                            "linked_skill_ids": ["skill_1"],
+                            "linked_assessment_point_ids": ["point_1"],
                             "status": "proposed",
                         }
                     ],
                 },
                 {"id": "violation_categories", "title": "Категории нарушений", "items": []},
-                {"id": "regulations", "title": "Правила и регламенты", "items": []},
-                {"id": "props", "title": "Реквизит и ресурсы", "items": []},
-                {"id": "shooting_notes", "title": "Съёмочные замечания", "items": []},
-                {"id": "constraints", "title": "Ограничения", "items": []},
+                {"id": "microtexts", "title": "Экранные тексты", "items": []},
+                {"id": "rules_and_regulations", "title": "Правила и регламенты", "items": []},
+                {"id": "props_and_locations", "title": "Реквизит и локации", "items": []},
+                {"id": "shooting_plan", "title": "Съёмочный план", "items": []},
             ]
         }
         return {**ensure_ids(doc, "scenario_plan"), **{k: base[k] for k in ("_mock", "_generation", "title")}}

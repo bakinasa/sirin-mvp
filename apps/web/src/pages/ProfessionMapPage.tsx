@@ -8,8 +8,8 @@ export function ProfessionMapPage() {
     <StageWorkspace
       projectId={projectId}
       stageType="profession_map"
-      title="Карта профессии"
-      subtitle="Вид работ, навыки, точки оценки и вопросы экспертам. Обсуждайте с AI, принимайте или отклоняйте элементы."
+      title="Сюжет и точки оценки"
+      subtitle="До 7 вариантов работ, навыки, точки оценки и укрупнённый сюжет. Это черновик до детального сценария: принимайте или отклоняйте элементы."
       allowAcceptReject
     />
   );

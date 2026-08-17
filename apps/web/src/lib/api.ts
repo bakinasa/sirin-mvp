@@ -189,7 +189,7 @@ export type CommentThread = {
 
 export const STEP_LABELS: Record<string, string> = {
   brief: "Brief",
-  profession_map: "Карта профессии",
+  profession_map: "Сюжет и точки оценки",
   scenario_plan: "Сценарий и съёмка",
   export: "Экспорт",
   source_summary: "Выжимка файлов",

@@ -189,7 +189,7 @@ export function StageWorkspace({
   }
 
   async function newEdition() {
-    if (!confirm("Создать новую редакцию карты? Сценарий будет помечен как устаревший.")) return;
+    if (!confirm("Создать новую редакцию сюжета? Сценарий будет помечен как устаревший.")) return;
     await api(`/projects/${projectId}/profession-map/new-edition`, { method: "POST" });
     await reload();
   }
@@ -269,9 +269,9 @@ export function StageWorkspace({
               даже если карточка не выбрана.
             </li>
             <li>
-              <b>В центре</b> кликните карточку, чтобы править точечно. Поля карточки можно менять руками;
-              состав полей задаётся промптом и ответом модели. Разделы слева — те, что вернула генерация
-              (названия и состав можно менять через промпт на шаге «Промты»).
+              <b>В центре</b> кликните карточку, чтобы править точечно. Поля карточки можно менять руками.
+              Разделы слева фиксированы: для сюжета — работы, навыки, точки оценки, укрупнённый сюжет и вопросы;
+              для сценария — обучение, диагностика, тексты, реквизит и съёмка.
             </li>
             <li>
               Справа: ввод → ниже <b>режим</b> (вопрос / правка цели / всё / коммент. / пункт) и <b>модель</b>.
@@ -303,7 +303,7 @@ export function StageWorkspace({
       )}
       {outdated && (
         <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">
-          Карта профессии изменилась. Этот сценарий устарел — пересоберите его.
+          Предсценарный сюжет изменился. Этот сценарий устарел — пересоберите его.
         </div>
       )}
       {error && (
@@ -409,6 +409,50 @@ function asDoc(content: unknown): BlockDocument {
   return { sections: [] };
 }
 
+const FIELD_LABELS: Record<string, string> = {
+  description: "Описание",
+  why_selected: "Почему выбран",
+  why_needed: "Зачем нужно",
+  priority: "Приоритет",
+  process_overview: "Ход работы",
+  likely_location: "Локация",
+  required_objects: "Объекты",
+  main_risks: "Риски",
+  related_work_ids: "Связанные работы",
+  related_work_id: "Работа",
+  observable_result: "Наблюдаемый результат",
+  criticality: "Критичность",
+  skill_id: "Навык",
+  correct_observation: "Правильно",
+  error_observation: "Ошибка",
+  visual_cues: "Визуальные признаки",
+  violation_category: "Категория нарушения",
+  story_steps: "Шаги сюжета",
+  training_focus: "Фокус обучения",
+  diagnostic_focus: "Фокус диагностики",
+  candidate_scene_groups: "Группы сцен",
+  scene_no: "№ сцены",
+  location: "Локация",
+  actors: "Актёры",
+  actions: "Действия",
+  visual_accents: "Визуальные акценты",
+  audio_text: "Аудиотекст",
+  on_screen_training_texts: "Экран: обучение",
+  on_screen_error_texts: "Экран: ошибка",
+  linked_skill_ids: "Навыки",
+  linked_assessment_point_ids: "Точки оценки",
+  staged_errors: "Инсценированные ошибки",
+  error_categories: "Категории ошибок",
+  example_errors: "Примеры ошибок",
+  text: "Текст",
+  mode: "Режим",
+  usage_context: "Контекст показа",
+  scene_refs: "Сцены",
+  setup_type: "Тип постановки",
+  props: "Реквизит",
+  notes: "Заметки",
+};
+
 function CommentBlock({
   title,
   threads,
@@ -511,7 +555,7 @@ function ItemCard({
         .filter((k) => k !== "title")
         .map((k) => (
           <div key={k}>
-            <label className="label text-xs">{k}</label>
+            <label className="label text-xs">{FIELD_LABELS[k] || k}</label>
             {typeof item[k] === "string" || typeof item[k] === "number" || item[k] == null ? (
               <textarea
                 className="input min-h-[56px]"

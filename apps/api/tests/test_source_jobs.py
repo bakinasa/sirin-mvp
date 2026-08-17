@@ -11,6 +11,11 @@ from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.llm.openai_compatible import (
+    _apply_prefill,
+    _extract_completion_text,
+    _thinking_off_extras,
+)
 from app.services.source_jobs import build_summary_job, summary_progress
 from app.services.json_content import (
     looks_like_reasoning_only,
@@ -44,6 +49,26 @@ class ReasoningParseTests(unittest.TestCase):
         text = "We need answer JSON only. Need analyze text between markers. Need produce fields."
         self.assertTrue(looks_like_reasoning_only(text))
         self.assertIsNone(try_parse_summary_from_text(text))
+
+    def test_prefer_json_field_over_reasoning_content(self):
+        message = {
+            "content": "We need produce JSON schema and analyze the document carefully.",
+            "reasoning_content": '{"brief_points": ["A"], "operations": [], "skills": [], '
+            '"violations": [], "visual_points": [], "constraints": [], '
+            '"terms": [], "important_fragments": []}',
+        }
+        text = _extract_completion_text(message, {})
+        summary = try_parse_summary_from_text(text)
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary["brief_points"], ["A"])
+
+    def test_prefill_opens_object(self):
+        self.assertEqual(_apply_prefill("{", '"brief_points": []}')[:1], "{")
+
+    def test_deepseek_thinking_off(self):
+        extra = _thinking_off_extras("https://api.deepseek.com", "deepseek-v4-flash")
+        self.assertEqual(extra.get("thinking"), {"type": "disabled"})
 
 
 class TokenBudgetTests(unittest.TestCase):

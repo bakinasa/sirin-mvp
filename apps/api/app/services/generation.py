@@ -197,6 +197,9 @@ async def _call_model(
     response_json: bool = True,
     timeout_seconds: int | None = None,
     max_tokens: int | None = None,
+    temperature: float | None = None,
+    extra_body: dict | None = None,
+    assistant_prefill: str = "",
 ):
     # UserModel stores the full upstream connection config + encrypted BYOK.
     api_key = decrypt_secret(model.encrypted_api_key)
@@ -221,10 +224,12 @@ async def _call_model(
         model=model.model_id,
         system=assembled["system_prompt"],
         user=assembled["user_message"],
-        temperature=0.2,
+        temperature=0.0 if step_type == "source_summary" else (temperature if temperature is not None else 0.2),
         max_tokens=max_tokens,
         response_json=response_json,
         timeout_seconds=timeout_seconds or 120,
+        extra_body=extra_body or {},
+        assistant_prefill=assistant_prefill,
     )
     return await adapter.generate(api_key, req)
 

@@ -28,6 +28,9 @@ CHUNK_OVERLAP = 150
 SUMMARY_PART_SIZE = 16000
 SUMMARY_PART_OVERLAP = 600
 SUMMARY_PARALLEL_PARTS = 3
+# Groq on_demand llama-3.3-70b: TPM/request budget is 12k including reserved max_tokens.
+GROQ_REQUEST_TOKEN_BUDGET = 11000
+CHARS_PER_TOKEN = 2.4
 
 SOURCE_SUMMARY_PROMPT = """Ты выполняешь высокоточную выжимку документа по профессии, операции, инструкции, процедуре или нормативным требованиям.
 
@@ -344,43 +347,36 @@ async def summarize_source(
     if not models:
         raise RuntimeError("Нет доступной модели для выжимки. Добавьте модель на странице «Модели».")
 
-    parts = _split_for_summary(source.parsed_text or "")
+    part_size = min(_part_char_budget(model, system) for model in models)
+    parts = _split_for_summary(source.parsed_text or "", size=part_size)
     total = len(parts) or 1
     await update_summary_progress(db, source, part_done=0, part_total=total, message="Подготовка")
+    logger.info(
+        "Summarizing source %s with %s parts (~%s chars), models=%s",
+        source.id,
+        total,
+        part_size,
+        [f"{getattr(m, 'provider_name', '')}:{getattr(m, 'model_id', '')}" for m in models],
+    )
 
-    semaphore = asyncio.Semaphore(SUMMARY_PARALLEL_PARTS)
+    parallel = 1 if any(_is_tight_token_limit(m) for m in models) else SUMMARY_PARALLEL_PARTS
+    semaphore = asyncio.Semaphore(parallel)
     progress_lock = asyncio.Lock()
     completed = 0
     ordered: list[dict[str, Any] | None] = [None] * len(parts)
 
     async def run_part(index: int, part: str) -> None:
         nonlocal completed
-        assembled = {
-            "system_prompt": system,
-            "user_message": _summary_user_message(
-                source.title,
-                source.source_type,
-                part,
-                part_index=index,
-                part_count=len(parts),
-            ),
-        }
-        last_error = ""
-        summary: dict[str, Any] | None = None
-        for model in models:
-            try:
-                async with semaphore:
-                    async with AsyncSessionLocal() as part_db:
-                        summary = await _summarize_once(part_db, model, assembled)
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_error = str(exc)
-                logger.warning(
-                    "Summary call failed (%s part %s): %s", model.model_id, index + 1, exc
-                )
-        if summary is None:
-            raise RuntimeError(last_error or "Модель вернула пустой ответ на выжимку")
-
+        summary = await _summarize_part_with_models(
+            models,
+            system=system,
+            title=source.title,
+            source_type=source.source_type,
+            part=part,
+            part_index=index,
+            part_count=len(parts),
+            semaphore=semaphore,
+        )
         ordered[index] = summary
         async with progress_lock:
             completed += 1
@@ -414,6 +410,63 @@ async def summarize_source(
     source.parse_error = ""
 
 
+async def _summarize_part_with_models(
+    models,
+    *,
+    system: str,
+    title: str,
+    source_type: str,
+    part: str,
+    part_index: int,
+    part_count: int,
+    semaphore: asyncio.Semaphore,
+    depth: int = 0,
+) -> dict[str, Any]:
+    assembled = {
+        "system_prompt": system,
+        "user_message": _summary_user_message(
+            title,
+            source_type,
+            part,
+            part_index=part_index,
+            part_count=part_count,
+        ),
+    }
+    errors: list[str] = []
+    for model in models:
+        try:
+            async with semaphore:
+                async with AsyncSessionLocal() as part_db:
+                    return await _summarize_once(part_db, model, assembled)
+        except Exception as exc:  # noqa: BLE001
+            label = f"{getattr(model, 'provider_name', '?')}:{getattr(model, 'model_id', '?')}"
+            logger.warning("Summary call failed (%s part %s): %s", label, part_index + 1, exc)
+            if _is_request_too_large(exc) and depth < 2 and len(part) > 1200:
+                halves = _split_for_summary_by_chars(
+                    part, size=max(len(part) // 2, 800), overlap=200
+                )
+                if len(halves) > 1:
+                    logger.info("Splitting oversized part %s into %s pieces", part_index + 1, len(halves))
+                    sub = []
+                    for half in halves:
+                        sub.append(
+                            await _summarize_part_with_models(
+                                models,
+                                system=system,
+                                title=title,
+                                source_type=source_type,
+                                part=half,
+                                part_index=part_index,
+                                part_count=part_count,
+                                semaphore=semaphore,
+                                depth=depth + 1,
+                            )
+                        )
+                    return _merge_summaries(sub)
+            errors.append(f"{label}: {exc}")
+    raise RuntimeError("; ".join(errors) or "Модель вернула пустой ответ на выжимку")
+
+
 async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any]:
     from app.services.generation import _call_model
     from app.services.json_content import (
@@ -422,9 +475,17 @@ async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any
         summary_has_content,
     )
 
+    input_tokens = _estimate_tokens(assembled["system_prompt"] + "\n" + assembled["user_message"])
+    max_out = _output_token_budget(model, input_tokens)
+    if max_out < 512:
+        raise RuntimeError(
+            f"часть слишком большая для лимита {getattr(model, 'provider_name', 'модели')} "
+            f"(вход ~{input_tokens} токенов, лимит запроса {_request_token_budget(model)})"
+        )
+
     attempts = (
-        {"response_json": False, "max_tokens": 16384, "timeout_seconds": 300},
-        {"response_json": True, "max_tokens": 8192, "timeout_seconds": 300},
+        {"response_json": False, "max_tokens": max_out, "timeout_seconds": 180},
+        {"response_json": True, "max_tokens": min(max_out, 4096), "timeout_seconds": 180},
     )
     errors: list[str] = []
     for kwargs in attempts:
@@ -432,6 +493,8 @@ async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any
             result = await _call_model(db, model, assembled, "source_summary", **kwargs)
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
+            if _is_request_too_large(exc):
+                raise
             continue
         content = (result.content or "").strip()
         if not content:
@@ -453,6 +516,51 @@ async def _summarize_once(db, model, assembled: dict[str, Any]) -> dict[str, Any
         preview = content[:500].replace("\n", " ").strip()
         errors.append(f"ответ модели не разобрался как JSON выжимки: {preview}")
     raise RuntimeError("; ".join(errors) or "не удалось получить выжимку")
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, int(len(text or "") / CHARS_PER_TOKEN) + 8)
+
+
+def _is_tight_token_limit(model) -> bool:
+    name = f"{getattr(model, 'provider_name', '')} {getattr(model, 'base_url', '')}".lower()
+    return "groq" in name
+
+
+def _request_token_budget(model) -> int:
+    if _is_tight_token_limit(model):
+        return GROQ_REQUEST_TOKEN_BUDGET
+    ctx = getattr(model, "context_window", None) or 32000
+    return max(4000, min(int(ctx), 32000))
+
+
+def _output_token_budget(model, input_tokens: int) -> int:
+    remaining = _request_token_budget(model) - input_tokens - 256
+    cap = 4096 if _is_tight_token_limit(model) else 8192
+    return max(0, min(cap, remaining))
+
+
+def _part_char_budget(model, system_prompt: str) -> int:
+    overhead = _estimate_tokens(system_prompt) + 400
+    output = 3500 if _is_tight_token_limit(model) else 6000
+    doc_tokens = _request_token_budget(model) - output - overhead
+    chars = int(max(800, doc_tokens) * CHARS_PER_TOKEN)
+    return min(SUMMARY_PART_SIZE, chars)
+
+
+def _is_request_too_large(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "request too large",
+            "reduce your message size",
+            "context_length",
+            "maximum context",
+            "too many tokens",
+            "prompt is too long",
+        )
+    ) or ("413" in text and "token" in text)
 
 
 def _summary_user_message(

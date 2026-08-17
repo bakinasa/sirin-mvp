@@ -14,10 +14,38 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.source_jobs import build_summary_job, summary_progress
 from app.services.sources import (
     SUMMARY_PART_SIZE,
+    _is_request_too_large,
     _merge_summaries,
+    _output_token_budget,
+    _part_char_budget,
     _split_for_summary,
     summarize_source,
 )
+
+
+class TokenBudgetTests(unittest.TestCase):
+    def test_groq_output_fits_12k_tpm(self):
+        model = type(
+            "M",
+            (),
+            {"provider_name": "Groq", "base_url": "https://api.groq.com/openai/v1", "context_window": 128000},
+        )()
+        max_out = _output_token_budget(model, 6400)
+        self.assertLessEqual(6400 + max_out + 256, 12000)
+        self.assertGreaterEqual(max_out, 512)
+
+    def test_groq_part_fits_budget(self):
+        model = type("M", (), {"provider_name": "Groq", "base_url": "https://api.groq.com", "context_window": None})()
+        chars = _part_char_budget(model, "system " * 400)
+        self.assertLessEqual(chars, 15000)
+        self.assertGreaterEqual(chars, 2000)
+
+    def test_detect_groq_413(self):
+        err = RuntimeError(
+            'Groq error 413: {"error":{"message":"Request too large for model `llama-3.3-70b-versatile` '
+            "on tokens per minute (TPM): Limit 12000, Requested 22823, please reduce your message size"
+        )
+        self.assertTrue(_is_request_too_large(err))
 
 
 class SplitForSummaryTests(unittest.TestCase):

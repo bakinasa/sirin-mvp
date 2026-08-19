@@ -10,6 +10,7 @@ from app.deps import get_current_user
 from app.models import ProjectSource, User
 from app.schemas import SourceDetailOut, SourceOut, SourceReprocessIn
 from app.services.source_jobs import schedule_summary_job
+from app.domain.enums import StepType
 from app.services.sources import (
     create_source_from_upload,
     delete_source,
@@ -17,6 +18,7 @@ from app.services.sources import (
     reprocess_source,
     source_to_out,
 )
+from app.services.stages import unlock_step_and_outdate_later
 
 router = APIRouter(tags=["sources"])
 
@@ -61,6 +63,7 @@ async def upload_source(
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"Не удалось обработать файл: {exc}") from exc
+    await unlock_step_and_outdate_later(db, project_id, StepType.BRIEF.value, required=False)
     if source.parse_status == "summarizing":
         background_tasks.add_task(schedule_summary_job, source.id)
     return SourceOut.model_validate(source_to_out(source))

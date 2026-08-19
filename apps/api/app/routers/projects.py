@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
 from app.deps import get_current_user
-from app.domain.enums import ProjectStatus
-from app.models import HumanEdit, PipelineRun, Project, User
+from app.domain.enums import ProjectStatus, StepType
+from app.models import Brief, HumanEdit, PipelineRun, Project, User
 from app.schemas import (
     BriefOut,
     BriefUpdate,
@@ -18,7 +18,7 @@ from app.schemas import (
 )
 from app.services.artifacts import approve_brief
 from app.services.projects import create_project_with_pipeline
-from app.models import Brief
+from app.services.stages import unlock_step_and_outdate_later
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -68,6 +68,7 @@ async def update_project(
         raise HTTPException(404, "Project not found")
     for key, value in body.model_dump(exclude_unset=True).items():
         setattr(project, key, value)
+    await unlock_step_and_outdate_later(db, project_id, StepType.BRIEF.value, required=False)
     await db.flush()
     await db.refresh(project)
     return project
@@ -116,6 +117,7 @@ async def put_brief(
     brief.version += 1
     if body.status:
         brief.status = body.status
+    await unlock_step_and_outdate_later(db, project_id, StepType.BRIEF.value, required=False)
     await db.flush()
     await db.refresh(brief)
     return brief

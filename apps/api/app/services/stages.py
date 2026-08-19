@@ -9,7 +9,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.enums import ArtifactStatus, ChangeType, ItemStatus, StepStatus, StepType
+from app.domain.enums import ArtifactStatus, ChangeType, ItemStatus, StepStatus, StepType, later_pipeline_steps
 from app.models import Artifact, ArtifactPatch, PipelineStep
 from app.services.document import (
     append_section_items,
@@ -66,7 +66,7 @@ async def add_section_item(
     items = section.get("items") or []
     if not isinstance(items, list):
         items = []
-    new_item = item_field_template(items)
+    new_item = item_field_template(items, section_id)
     new_item["title"] = title.strip()
     new_item["description"] = description.strip()
     if extra:
@@ -197,7 +197,7 @@ async def restore_version(
     step = await _get_step(db, current.project_id, current.step_type)
     if step:
         if step.status == StepStatus.LOCKED.value:
-            raise StageEditError("Шаг зафиксирован. Сначала создайте новую редакцию.")
+            await unlock_step_and_outdate_later(db, current.project_id, current.step_type)
         step.current_artifact_id = restored.id
         step.status = StepStatus.UNDER_REVIEW.value
     await db.refresh(restored)
@@ -205,26 +205,79 @@ async def restore_version(
 
 
 async def new_map_edition(db: AsyncSession, project_id: UUID) -> dict:
-    """Unlock profession_map and mark scenario_plan as outdated."""
-    map_step = await _get_step(db, project_id, StepType.PROFESSION_MAP.value)
-    if map_step is None:
-        raise StageEditError("Карта профессии не найдена")
-    map_step.status = StepStatus.UNDER_REVIEW.value
-    if map_step.current_artifact_id:
-        art = await db.get(Artifact, map_step.current_artifact_id)
-        if art:
-            art.frozen = False
+    """Unlock profession_map and mark later steps outdated (artifacts kept)."""
+    return await unlock_step_and_outdate_later(
+        db, project_id, StepType.PROFESSION_MAP.value, required=True
+    )
 
-    scenario = await _get_step(db, project_id, StepType.SCENARIO_PLAN.value)
-    if scenario and scenario.status not in (StepStatus.DRAFT.value,):
-        scenario.status = StepStatus.OUTDATED.value
 
+async def unlock_step_and_outdate_later(
+    db: AsyncSession,
+    project_id: UUID,
+    step_type: str,
+    *,
+    required: bool = True,
+    unfreeze_current: bool = True,
+) -> dict:
+    """Re-open a step in place and mark subsequent steps with artifacts as outdated.
+
+    Does not clear current_artifact_id — previous documents stay available.
+    """
+    result = await db.execute(select(PipelineStep).where(PipelineStep.project_id == project_id))
+    steps = {s.step_type: s for s in result.scalars().all()}
+    current = steps.get(step_type)
+    if current is None:
+        if required:
+            raise StageEditError(f"Шаг {step_type} не найден")
+        return {"unlocked": None, "outdated": [], "warning": None}
+
+    if step_type != StepType.BRIEF.value:
+        current.status = StepStatus.UNDER_REVIEW.value
+        if unfreeze_current and current.current_artifact_id:
+            art = await db.get(Artifact, current.current_artifact_id)
+            if art:
+                art.frozen = False
+
+    outdated = await mark_later_steps_outdated(db, project_id, step_type, steps=steps)
     await db.flush()
+    warning = None
+    if outdated:
+        warning = "Последующие шаги помечены как устаревшие; артефакты сохранены."
     return {
-        "profession_map_status": map_step.status,
-        "scenario_plan_status": scenario.status if scenario else None,
-        "warning": "Сценарий помечен как устаревший и потребует пересборки.",
+        "unlocked": step_type,
+        "status": current.status,
+        "outdated": outdated,
+        "profession_map_status": steps.get(StepType.PROFESSION_MAP.value).status
+        if steps.get(StepType.PROFESSION_MAP.value)
+        else None,
+        "scenario_plan_status": steps.get(StepType.SCENARIO_PLAN.value).status
+        if steps.get(StepType.SCENARIO_PLAN.value)
+        else None,
+        "warning": warning,
     }
+
+
+async def mark_later_steps_outdated(
+    db: AsyncSession,
+    project_id: UUID,
+    step_type: str,
+    *,
+    steps: dict[str, PipelineStep] | None = None,
+) -> list[str]:
+    """Set later pipeline steps that already have an artifact to outdated. Keep artifact ids."""
+    if steps is None:
+        result = await db.execute(select(PipelineStep).where(PipelineStep.project_id == project_id))
+        steps = {s.step_type: s for s in result.scalars().all()}
+    outdated: list[str] = []
+    for later in later_pipeline_steps(step_type):
+        step = steps.get(later)
+        if step is None:
+            continue
+        if step.current_artifact_id or step.approved_artifact_id:
+            step.status = StepStatus.OUTDATED.value
+            outdated.append(later)
+    await db.flush()
+    return outdated
 
 
 async def apply_patch(
@@ -276,14 +329,14 @@ async def discard_patch(db: AsyncSession, patch: ArtifactPatch) -> ArtifactPatch
 async def _editable_artifact(
     db: AsyncSession, project_id: UUID, step_type: str
 ) -> Artifact:
-    step = await _get_step(db, project_id, step_type)
-    if step and step.status == StepStatus.LOCKED.value:
-        raise StageEditError("Шаг зафиксирован. Чтобы изменить его, создайте новую редакцию.")
     artifact = await get_current_artifact(db, project_id, step_type)
     if artifact is None:
         raise StageEditError("Нет текущего документа")
-    if artifact.frozen:
-        raise StageEditError("Версия зафиксирована")
+    step = await _get_step(db, project_id, step_type)
+    needs_unlock = bool(artifact.frozen) or (step is not None and step.status == StepStatus.LOCKED.value)
+    if needs_unlock:
+        await unlock_step_and_outdate_later(db, project_id, step_type)
+        await db.refresh(artifact)
     return artifact
 
 

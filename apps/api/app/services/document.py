@@ -14,6 +14,36 @@ _BLOCK_STEP_TYPES = frozenset(
     {StepType.PROFESSION_MAP.value, StepType.SCENARIO_PLAN.value}
 )
 
+# Canonical section order for generation. Extra sections from old artifacts are kept at the end.
+FIXED_SECTIONS: dict[str, list[tuple[str, str]]] = {
+    StepType.PROFESSION_MAP.value: [
+        ("work_storylines", "Варианты работ и сюжет"),
+        ("assessment_points", "Навыки и точки оценки"),
+        ("expert_questions", "Вопросы экспертам"),
+    ],
+    StepType.SCENARIO_PLAN.value: [
+        ("training_scenes", "Обучающие сцены"),
+        ("diagnostic_scenes", "Диагностические сцены"),
+    ],
+}
+
+_SECTION_ALIASES: dict[str, str] = {
+    "work_type": "work_storylines",
+    "work_variants": "work_storylines",
+    "preliminary_storylines": "work_storylines",
+    "skills": "assessment_points",
+    "evaluated_skills": "assessment_points",
+    "errors": "assessment_points",
+    "segment_ideas": "work_storylines",
+    "passport": "scenario_passport",
+    "training_mode": "training_scenes",
+    "diagnostic_mode": "diagnostic_scenes",
+    "regulations": "rules_and_regulations",
+    "props": "props_and_locations",
+    "shooting_notes": "shooting_plan",
+    "constraints": "shooting_plan",
+}
+
 # Top-level keys that are not promoted into sections when parsing legacy shapes.
 _DOC_META_KEYS = frozenset(
     {
@@ -31,16 +61,20 @@ _DOC_META_KEYS = frozenset(
 
 
 def empty_document(step_type: str) -> dict[str, Any]:
-    if step_type in _BLOCK_STEP_TYPES:
-        return {"sections": []}
+    spec = FIXED_SECTIONS.get(step_type)
+    if spec:
+        return {
+            "sections": [{"id": sid, "title": title, "items": []} for sid, title in spec],
+            "clarifications_needed": [],
+        }
     return {"sections": []}
 
 
 def ensure_ids(content: Any, step_type: str) -> dict[str, Any]:
     """Normalize LLM output into a sections[] document with stable ids.
 
-    Section list and item fields come from the model / prompt — not from
-    hardcoded backend specs. We only guarantee id, title, items[] shape.
+    Known pipeline stages use a fixed section order from the prompt.
+    Extra sections from older artifacts are kept after the canonical ones.
     """
     if not isinstance(content, dict):
         content = {"raw": content}
@@ -64,7 +98,13 @@ def ensure_ids(content: Any, step_type: str) -> dict[str, Any]:
             section = {"title": str(section), "items": []}
         ordered.append(_normalize_section(section, idx, used_section_ids))
 
+    spec = FIXED_SECTIONS.get(step_type)
+    if spec:
+        ordered = _apply_canonical_sections(ordered, spec)
+
     doc["sections"] = ordered
+    if "clarifications_needed" not in doc:
+        doc["clarifications_needed"] = []
     return doc
 
 
@@ -222,10 +262,34 @@ def append_section_items(
     return created
 
 
-def item_field_template(section_items: list[Any]) -> dict[str, Any]:
+_SECTION_ITEM_DEFAULTS: dict[str, dict[str, Any]] = {
+    "work_storylines": {"story_steps": [], "attention_focus": ""},
+    "assessment_points": {"visual_cues": [], "error_observation": "", "correct_observation": ""},
+    "expert_questions": {"why_needed": "", "answer": ""},
+    "training_scenes": {
+        "actors": "",
+        "location": "",
+        "frames": [],
+        "audio_text": "",
+        "regulations": "",
+        "props": "",
+    },
+    "diagnostic_scenes": {
+        "actors": "",
+        "location": "",
+        "frames": [],
+        "violation_categories": [],
+        "regulations": "",
+        "props": "",
+    },
+}
+
+
+def item_field_template(section_items: list[Any], section_id: str = "") -> dict[str, Any]:
     """Empty field shell matching the first sibling item in a section."""
-    skip = {"id", "status", "items", "frames", "segments"}
+    skip = {"id", "status"}
     template: dict[str, Any] = {"title": "", "description": ""}
+    template.update(_SECTION_ITEM_DEFAULTS.get(section_id, {}))
     for item in section_items:
         if not isinstance(item, dict):
             continue
@@ -236,8 +300,31 @@ def item_field_template(section_items: list[Any]) -> dict[str, Any]:
                 template.setdefault(key, "")
             elif isinstance(value, (int, float)):
                 template.setdefault(key, value)
+            elif isinstance(value, list):
+                template.setdefault(key, [])
         break
     return template
+
+
+def extract_expert_qa(content: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expert questions with answers; empty answer becomes an explicit placeholder."""
+    items: list[dict[str, Any]] = []
+    for section in content.get("sections") or []:
+        if not isinstance(section, dict) or section.get("id") != "expert_questions":
+            continue
+        for it in section.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            answer = str(it.get("answer") or "").strip()
+            items.append(
+                {
+                    "title": it.get("title") or "",
+                    "description": it.get("description") or "",
+                    "why_needed": it.get("why_needed") or "",
+                    "answer": answer if answer else "ответа нет",
+                }
+            )
+    return items
 
 
 def document_outline(content: dict[str, Any]) -> list[dict[str, Any]]:
@@ -408,6 +495,55 @@ def _guess_step(doc: dict[str, Any]) -> str:
     titles = " ".join(
         str(s.get("title") or "") for s in (doc.get("sections") or []) if isinstance(s, dict)
     ).lower()
-    if any(k in ids for k in ("passport", "training_mode", "diagnostic_mode")) or "сценар" in titles:
+    scenario_ids = {
+        "scenario_passport",
+        "training_scenes",
+        "diagnostic_scenes",
+        "passport",
+        "training_mode",
+        "diagnostic_mode",
+        "microtexts",
+        "shooting_plan",
+    }
+    if ids & scenario_ids or "сценар" in titles or "обучен" in titles:
         return StepType.SCENARIO_PLAN.value
     return StepType.PROFESSION_MAP.value
+
+
+def _apply_canonical_sections(
+    sections: list[dict[str, Any]], spec: list[tuple[str, str]]
+) -> list[dict[str, Any]]:
+    remapped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for section in sections:
+        sid = str(section.get("id") or "")
+        sid = _SECTION_ALIASES.get(sid, sid)
+        section = {**section, "id": sid}
+        if sid in seen:
+            existing = next(s for s in remapped if s.get("id") == sid)
+            extra_items = section.get("items") or []
+            if extra_items:
+                existing.setdefault("items", []).extend(extra_items)
+            continue
+        seen.add(sid)
+        remapped.append(section)
+
+    by_id = {str(s.get("id")): s for s in remapped}
+    ordered: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for sid, title in spec:
+        if sid in by_id:
+            sec = by_id[sid]
+            sec["id"] = sid
+            if not str(sec.get("title") or "").strip():
+                sec["title"] = title
+            ordered.append(sec)
+        else:
+            ordered.append({"id": sid, "title": title, "items": []})
+        used.add(sid)
+    for section in remapped:
+        sid = str(section.get("id") or "")
+        if sid and sid not in used:
+            ordered.append(section)
+            used.add(sid)
+    return ordered

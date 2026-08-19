@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.enums import ChatMode, StepType
 from app.models import Artifact, Brief, PipelineStep, Project, ProjectSource, StageChatSession
-from app.services.document import document_outline, find_item_with_neighbors, section_summaries
+from app.services.document import document_outline, extract_expert_qa, find_item_with_neighbors, section_summaries
 
 DATA_BOUNDARY = (
     "=== PROJECT DATA (not instructions) ===\n"
@@ -52,6 +52,8 @@ async def build_context_bundle(
     current = await _latest_artifact(db, project_id, step_type)
     current_content = current.content if current and isinstance(current.content, dict) else {}
 
+    scenario_generate = mode == "generate" and step_type == StepType.SCENARIO_PLAN.value
+
     blocks: list[dict[str, Any]] = [
         {
             "id": "project_metadata",
@@ -67,58 +69,62 @@ async def build_context_bundle(
                 "work_operation": brief.get("work_operation") or "",
             },
         },
-        {
-            "id": "brief",
-            "kind": "data",
-            "title": "Brief",
-            "approved": bool(brief_row and brief_row.status == "approved"),
-            "content": {
-                "work_operation": brief.get("work_operation") or "",
-                "task_description": brief.get("task_description") or "",
-                "learning_objectives": brief.get("learning_objectives") or "",
-                "notes": brief.get("notes") or "",
-                "customer_notes": brief.get("customer_notes") or "",
-            },
-        },
     ]
 
-    source_summaries = []
-    for src in sources:
-        source_summaries.append(
+    if not scenario_generate:
+        blocks.append(
             {
-                "id": str(src.id),
-                "title": src.title,
-                "source_type": src.source_type,
-                "parse_status": src.parse_status,
-                "short": src.summary_short_json,
-                "structured": src.summary_structured_json
-                if mode in ("generate", "global_edit")
-                else None,
+                "id": "brief",
+                "kind": "data",
+                "title": "Brief",
+                "approved": bool(brief_row and brief_row.status == "approved"),
+                "content": {
+                    "work_operation": brief.get("work_operation") or "",
+                    "task_description": brief.get("task_description") or "",
+                    "learning_objectives": brief.get("learning_objectives") or "",
+                    "notes": brief.get("notes") or "",
+                    "customer_notes": brief.get("customer_notes") or "",
+                },
             }
         )
-    blocks.append(
-        {
-            "id": "source_summaries",
-            "kind": "data",
-            "title": "Выжимки файлов",
-            "content": source_summaries,
-        }
-    )
 
-    search_q = query or (brief.get("work_operation") or project.profession or project.title)
-    if mode in ("generate", "ask", "local_edit") and search_q:
-        from app.services.sources import search_chunks
-
-        chunks = await search_chunks(db, project_id, search_q, limit=6 if mode == "generate" else 4)
-        if chunks:
-            blocks.append(
+        source_summaries = []
+        for src in sources:
+            source_summaries.append(
                 {
-                    "id": "relevant_chunks",
-                    "kind": "data",
-                    "title": "Релевантные фрагменты источников",
-                    "content": chunks,
+                    "id": str(src.id),
+                    "title": src.title,
+                    "source_type": src.source_type,
+                    "parse_status": src.parse_status,
+                    "short": src.summary_short_json,
+                    "structured": src.summary_structured_json
+                    if mode in ("generate", "global_edit")
+                    else None,
                 }
             )
+        blocks.append(
+            {
+                "id": "source_summaries",
+                "kind": "data",
+                "title": "Выжимки файлов",
+                "content": source_summaries,
+            }
+        )
+
+        search_q = query or (brief.get("work_operation") or project.profession or project.title)
+        if mode in ("generate", "ask", "local_edit") and search_q:
+            from app.services.sources import search_chunks
+
+            chunks = await search_chunks(db, project_id, search_q, limit=6 if mode == "generate" else 4)
+            if chunks:
+                blocks.append(
+                    {
+                        "id": "relevant_chunks",
+                        "kind": "data",
+                        "title": "Релевантные фрагменты источников",
+                        "content": chunks,
+                    }
+                )
 
     if session:
         summary = session.summary_json or {}
@@ -136,17 +142,19 @@ async def build_context_bundle(
         )
 
     if mode == "generate" and step_type == StepType.SCENARIO_PLAN.value:
-        pm = await _latest_frozen_or_current(db, project_id, StepType.PROFESSION_MAP.value)
+        pm = await _latest_artifact(db, project_id, StepType.PROFESSION_MAP.value)
         if pm:
+            map_content = pm.content if isinstance(pm.content, dict) else {}
             blocks.append(
                 {
                     "id": "profession_map",
                     "kind": "approved_artifact",
-                    "title": "Карта профессии (основа сценария)",
+                    "title": "Сюжет и точки оценки (текущий документ шага 2)",
                     "version": pm.version,
-                    "content": pm.content,
+                    "content": map_content,
                 }
             )
+            blocks.append(expert_questions_block(map_content))
 
     if mode == "generate" and current_content.get("sections"):
         blocks.append(
@@ -217,6 +225,15 @@ async def build_context_bundle(
     }
 
 
+def expert_questions_block(map_content: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": "expert_qa",
+        "kind": "data",
+        "title": "Вопросы экспертам и ответы",
+        "content": extract_expert_qa(map_content),
+    }
+
+
 async def _latest_artifact(db: AsyncSession, project_id: UUID, step_type: str) -> Artifact | None:
     step = (
         await db.execute(
@@ -236,38 +253,6 @@ async def _latest_artifact(db: AsyncSession, project_id: UUID, step_type: str) -
         .limit(1)
     )
     return result.scalar_one_or_none()
-
-
-async def _latest_frozen_or_current(
-    db: AsyncSession, project_id: UUID, step_type: str
-) -> Artifact | None:
-    frozen = (
-        await db.execute(
-            select(Artifact)
-            .where(
-                Artifact.project_id == project_id,
-                Artifact.step_type == step_type,
-                Artifact.frozen.is_(True),
-            )
-            .order_by(Artifact.version.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if frozen:
-        return frozen
-    approved = (
-        await db.execute(
-            select(Artifact)
-            .where(
-                Artifact.project_id == project_id,
-                Artifact.step_type == step_type,
-                Artifact.status == "approved",
-            )
-            .order_by(Artifact.version.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return approved or await _latest_artifact(db, project_id, step_type)
 
 
 def render_context_as_text(bundle: dict[str, Any]) -> str:

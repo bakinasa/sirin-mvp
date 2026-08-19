@@ -17,7 +17,7 @@ from app.models import Artifact, PipelineRun, PipelineStep, PromptEditHistory, U
 from app.security.crypto import decrypt_secret
 from app.services.document import ensure_ids
 from app.services.json_content import parse_llm_json_content
-from app.services.pipeline_gate import PipelineGateError, assert_can_run_step
+from app.services.pipeline_gate import assert_can_run_step
 from app.services.prompt_assembler import assemble_prompt
 from app.llm.base import GenerateRequest
 
@@ -36,9 +36,10 @@ async def create_pipeline_run(
 ) -> PipelineRun:
     step = await assert_can_run_step(db, project_id, step_type)
     if step.status == StepStatus.LOCKED.value:
-        raise PipelineGateError(
-            "Шаг зафиксирован. Чтобы изменить его, создайте новую редакцию."
-        )
+        step.status = StepStatus.UNDER_REVIEW.value
+    from app.services.stages import mark_later_steps_outdated
+
+    await mark_later_steps_outdated(db, project_id, step_type)
 
     # Expert feedback is human-collected; no AI run needed to "complete" collection,
     # but synthesis/other generative steps are AI.
@@ -180,9 +181,6 @@ async def execute_run(db: AsyncSession, run_id: UUID) -> PipelineRun:
     step.current_artifact_id = artifact.id
     step.status = StepStatus.AI_GENERATED.value
 
-    if step.step_type == StepType.SCENARIO_PLAN.value:
-        await _lock_previous_map(db, run.project_id)
-
     await db.flush()
     await db.refresh(run)
     return run
@@ -267,25 +265,6 @@ async def _resolve_models(
                 break
 
     return primary, fallback
-
-
-async def _lock_previous_map(db: AsyncSession, project_id: UUID) -> None:
-    result = await db.execute(
-        select(PipelineStep).where(
-            PipelineStep.project_id == project_id,
-            PipelineStep.step_type == StepType.PROFESSION_MAP.value,
-        )
-    )
-    step = result.scalar_one_or_none()
-    if step is None:
-        return
-    step.status = StepStatus.LOCKED.value
-    if step.current_artifact_id:
-        art = await db.get(Artifact, step.current_artifact_id)
-        if art:
-            art.frozen = True
-            if not step.approved_artifact_id:
-                step.approved_artifact_id = art.id
 
 
 async def _next_version(db: AsyncSession, project_id: UUID, step_type: str) -> int:
@@ -504,69 +483,34 @@ def _mock_artifact(step_type: str, assembled: dict, reason: str = "") -> dict:
         doc = {
             "sections": [
                 {
-                    "id": "work_variants",
-                    "title": "Варианты работ для оценки",
+                    "id": "work_storylines",
+                    "title": "Варианты работ и сюжет",
                     "items": [
                         {
                             "id": "work_1",
                             "title": topic,
                             "description": work_ctx or f"Операция по проекту «{title}»",
-                            "why_selected": "Собрано из brief без вызова модели",
-                            "priority": "high",
-                            "process_overview": ["Подготовка", "Основная работа", "Завершение"],
-                            "likely_location": work_ctx or "рабочая площадка",
-                            "required_objects": [x for x in [tools] if x],
-                            "main_risks": [x for x in [safety] if x],
-                            "status": "proposed",
-                        }
-                    ],
-                },
-                {
-                    "id": "evaluated_skills",
-                    "title": "Оцениваемые навыки",
-                    "items": [
-                        {
-                            "id": "skill_1",
-                            "title": "Безопасное выполнение операции",
-                            "description": f"Наблюдаемый навык для: {topic}",
-                            "related_work_ids": ["work_1"],
-                            "observable_result": "Действия выполняются в регламентном порядке",
-                            "criticality": "high",
+                            "story_steps": ["Подготовка", "Основная работа", "Завершение"],
+                            "attention_focus": "Порядок действий и СИЗ видны в кадре",
                             "status": "proposed",
                         }
                     ],
                 },
                 {
                     "id": "assessment_points",
-                    "title": "Точки оценки",
+                    "title": "Навыки и точки оценки",
                     "items": [
                         {
                             "id": "point_1",
                             "title": "Соблюдение порядка действий",
                             "description": "Проверяется последовательность операций в кадре",
-                            "skill_id": "skill_1",
-                            "related_work_ids": ["work_1"],
-                            "correct_observation": "Действия по регламенту",
-                            "error_observation": "Пропуск шага или нарушение порядка",
-                            "visual_cues": ["Порядок действий виден в кадре"],
-                            "violation_category": "порядок работ",
-                            "status": "proposed",
-                        }
-                    ],
-                },
-                {
-                    "id": "preliminary_storylines",
-                    "title": "Предварительный сюжет",
-                    "items": [
-                        {
-                            "id": "story_1",
-                            "title": topic,
-                            "related_work_id": "work_1",
-                            "description": f"Укрупнённый сюжет по работе: {topic}",
-                            "story_steps": ["Подготовка", "Основная работа", "Завершение"],
-                            "training_focus": ["Правильное выполнение этапов"],
-                            "diagnostic_focus": [pains or "Типовое нарушение порядка"],
-                            "candidate_scene_groups": ["подготовка", "основная работа", "завершение"],
+                            "errors": [
+                                {
+                                    "error": "Пропуск шага или нарушение порядка",
+                                    "correct": "Действия по регламенту",
+                                    "visual_cues": ["Порядок действий виден в кадре", "СИЗ надеты до начала работы"],
+                                }
+                            ],
                             "status": "proposed",
                         }
                     ],
@@ -580,6 +524,7 @@ def _mock_artifact(step_type: str, assembled: dict, reason: str = "") -> dict:
                             "title": "Какие нарушения эксперты считают критичными?",
                             "description": "Нужно уточнить наблюдаемые ошибки для диагностики",
                             "why_needed": "В brief недостаточно данных для сцен ошибок",
+                            "answer": "",
                             "status": "proposed",
                         }
                     ],
@@ -594,65 +539,64 @@ def _mock_artifact(step_type: str, assembled: dict, reason: str = "") -> dict:
         doc = {
             "sections": [
                 {
-                    "id": "scenario_passport",
-                    "title": "Паспорт сценария",
-                    "items": [
-                        {
-                            "id": "passport_1",
-                            "title": title,
-                            "description": f"Модуль по операции: {topic}. Режимы: обучение и диагностика.",
-                            "status": "proposed",
-                        }
-                    ],
-                },
-                {
                     "id": "training_scenes",
-                    "title": "Режим обучения",
+                    "title": "Обучающие сцены",
                     "items": [
                         {
                             "id": "train_1",
-                            "scene_no": 1,
-                            "title": "Правильное выполнение",
-                            "description": f"Показать корректное выполнение: {topic}",
-                            "location": work_ctx or "рабочая площадка",
-                            "actors": ["исполнитель"],
-                            "actions": [f"Выполнить {topic} по регламенту"],
-                            "visual_accents": ["Ключевые действия и СИЗ"],
-                            "audio_text": f"Начните с осмотра зоны для: {topic}",
-                            "on_screen_training_texts": ["Соблюдайте порядок действий"],
-                            "linked_skill_ids": ["skill_1"],
-                            "linked_assessment_point_ids": ["point_1"],
+                            "title": topic or "Выход из подъезда",
+                            "actors": "исполнитель",
+                            "location": work_ctx or "подъезд / придомовая территория",
+                            "frames": [
+                                {
+                                    "shot_no": 1,
+                                    "action": f"Исполнитель выполняет: {topic}",
+                                    "accent": "Крупно видны руки, инструмент и порядок действий",
+                                }
+                            ],
+                            "audio_text": f"Перед началом работы «{topic}» убедитесь в правильной последовательности действий. Осмотрите рабочую зону и проверьте наличие необходимых СИЗ. Выполняйте каждый шаг согласно регламенту, не пропуская обязательных этапов. Это обеспечивает безопасность и качество работы.",
+                            "regulations": ["Регламент проекта"],
+                            "props": tools or "СИЗ, рабочий инструмент",
                             "status": "proposed",
                         }
                     ],
                 },
                 {
                     "id": "diagnostic_scenes",
-                    "title": "Режим диагностики",
+                    "title": "Диагностические сцены",
                     "items": [
                         {
                             "id": "diag_1",
-                            "scene_no": 1,
-                            "title": "Поиск нарушений",
-                            "description": "На том же этапе работы актёр допускает наблюдаемую ошибку",
-                            "location": work_ctx or "рабочая площадка",
-                            "actors": ["исполнитель"],
-                            "staged_errors": [pains or "Типовое нарушение порядка"],
-                            "error_categories": ["порядок работ"],
-                            "visual_accents": ["Момент, когда нарушение видно в кадре"],
-                            "audio_text": "",
-                            "on_screen_error_texts": ["Нарушен порядок действий"],
-                            "linked_skill_ids": ["skill_1"],
-                            "linked_assessment_point_ids": ["point_1"],
+                            "title": topic or "Выход из подъезда",
+                            "actors": "исполнитель",
+                            "location": work_ctx or "подъезд / придомовая территория",
+                            "frames": [
+                                {
+                                    "shot_no": 1,
+                                    "action": f"Исполнитель выполняет: {topic}",
+                                    "violation": "",
+                                    "accent": "Общий план — вход в зону работ",
+                                },
+                                {
+                                    "shot_no": 2,
+                                    "action": "Исполнитель нарушает порядок действий",
+                                    "violation": pains or "Нарушен порядок действий",
+                                    "accent": "Момент, когда нарушение видно в кадре",
+                                },
+                            ],
+                            "violation_categories": [
+                                {
+                                    "title": "Категория 1. Порядок работ",
+                                    "violation": pains or "Нарушен порядок действий",
+                                    "description": "Пропуск или перестановка обязательных шагов процедуры. Нарушает регламент выполнения работ и создаёт риск некачественного результата или травмы.",
+                                }
+                            ],
+                            "regulations": ["Регламент проекта"],
+                            "props": tools or "СИЗ, рабочий инструмент",
                             "status": "proposed",
                         }
                     ],
                 },
-                {"id": "violation_categories", "title": "Категории нарушений", "items": []},
-                {"id": "microtexts", "title": "Экранные тексты", "items": []},
-                {"id": "rules_and_regulations", "title": "Правила и регламенты", "items": []},
-                {"id": "props_and_locations", "title": "Реквизит и локации", "items": []},
-                {"id": "shooting_plan", "title": "Съёмочный план", "items": []},
             ]
         }
         return {**ensure_ids(doc, "scenario_plan"), **{k: base[k] for k in ("_mock", "_generation", "title")}}

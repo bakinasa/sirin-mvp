@@ -22,7 +22,10 @@ async def update_artifact(
     comment: str = "",
 ) -> Artifact:
     if getattr(artifact, "frozen", False):
-        raise ValueError("Версия зафиксирована")
+        from app.services.stages import unlock_step_and_outdate_later
+
+        await unlock_step_and_outdate_later(db, artifact.project_id, artifact.step_type)
+        await db.refresh(artifact)
     before = artifact.content
     dmp = diff_match_patch()
     before_s = json.dumps(before, ensure_ascii=False, sort_keys=True)
@@ -43,8 +46,6 @@ async def update_artifact(
     )
     artifact.content = new_content
     artifact.status = ArtifactStatus.EDITED.value
-    if getattr(artifact, "frozen", False):
-        raise ValueError("Версия зафиксирована")
     artifact.change_type = "manual"
     await _set_step_status(db, artifact.project_id, artifact.step_type, StepStatus.UNDER_REVIEW)
     await db.flush()

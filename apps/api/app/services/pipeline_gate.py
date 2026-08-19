@@ -1,11 +1,11 @@
-"""HITL gate: next AI step cannot run until previous step is Approved."""
+"""Whether the previous pipeline step has enough data to generate the next one."""
 
 from __future__ import annotations
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.domain.enums import PIPELINE_ORDER, StepStatus, StepType
+from app.domain.enums import PIPELINE_ORDER, StepType, previous_step_allows_generate
 from app.models import PipelineStep
 
 
@@ -19,8 +19,8 @@ async def assert_can_run_step(
     db: AsyncSession, project_id, step_type: str
 ) -> PipelineStep:
     """
-    Invariant: for step at index i > 0, step i-1 must be Approved (or Locked).
-    Brief is filled manually; export only needs storyboard approved.
+    Previous step must exist. Brief is enough as-is; later steps need a current artifact
+    (approved/locked not required, so a step can be rebuilt after returning to an earlier one).
     """
     try:
         target = StepType(step_type)
@@ -45,10 +45,9 @@ async def assert_can_run_step(
         prev_step = steps.get(prev.value)
         if prev_step is None:
             raise PipelineGateError(f"Previous step missing: {prev.value}")
-        if prev_step.status not in (StepStatus.APPROVED, StepStatus.LOCKED):
+        if not previous_step_allows_generate(prev.value, bool(prev_step.current_artifact_id)):
             raise PipelineGateError(
-                f"Шаг «{prev.value}» должен быть Approved перед запуском «{step_type}». "
-                f"Текущий статус: {prev_step.status}"
+                f"Шаг «{prev.value}» должен иметь документ перед запуском «{step_type}»."
             )
 
     return current

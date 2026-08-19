@@ -51,6 +51,23 @@ PIPELINE_ORDER: list[StepType] = [
 
 VISIBLE_STEP_TYPES: set[str] = {s.value for s in PIPELINE_ORDER}
 
+
+def later_pipeline_steps(step_type: str) -> list[str]:
+    """Step types after `step_type` in the user-facing pipeline."""
+    values = [s.value for s in PIPELINE_ORDER]
+    try:
+        idx = values.index(step_type)
+    except ValueError:
+        return []
+    return values[idx + 1 :]
+
+
+def previous_step_allows_generate(prev_type: str, has_artifact: bool) -> bool:
+    """Brief is filled manually; later steps only need a current artifact."""
+    if prev_type == StepType.BRIEF.value:
+        return True
+    return has_artifact
+
 LEGACY_STEP_TYPES: set[str] = {
     StepType.DRAFT_TZ.value,
     StepType.EXPERT_FEEDBACK.value,
@@ -102,6 +119,7 @@ class ExportType(StrEnum):
     MARKDOWN = "markdown"
     JSON = "json"
     TEXT_BUNDLE = "text_bundle"
+    DOCX_SCENARIO = "docx_scenario"
 
 
 class ExportStatus(StrEnum):

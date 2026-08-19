@@ -17,29 +17,24 @@ _BLOCK_STEP_TYPES = frozenset(
 # Canonical section order for generation. Extra sections from old artifacts are kept at the end.
 FIXED_SECTIONS: dict[str, list[tuple[str, str]]] = {
     StepType.PROFESSION_MAP.value: [
-        ("work_variants", "Варианты работ для оценки"),
-        ("evaluated_skills", "Оцениваемые навыки"),
-        ("assessment_points", "Точки оценки"),
-        ("preliminary_storylines", "Предварительный сюжет"),
+        ("work_storylines", "Варианты работ и сюжет"),
+        ("assessment_points", "Навыки и точки оценки"),
         ("expert_questions", "Вопросы экспертам"),
     ],
     StepType.SCENARIO_PLAN.value: [
-        ("scenario_passport", "Паспорт сценария"),
-        ("training_scenes", "Режим обучения"),
-        ("diagnostic_scenes", "Режим диагностики"),
-        ("violation_categories", "Категории нарушений"),
-        ("microtexts", "Экранные тексты"),
-        ("rules_and_regulations", "Правила и регламенты"),
-        ("props_and_locations", "Реквизит и локации"),
-        ("shooting_plan", "Съёмочный план"),
+        ("training_scenes", "Обучающие сцены"),
+        ("diagnostic_scenes", "Диагностические сцены"),
     ],
 }
 
 _SECTION_ALIASES: dict[str, str] = {
-    "work_type": "work_variants",
-    "skills": "evaluated_skills",
+    "work_type": "work_storylines",
+    "work_variants": "work_storylines",
+    "preliminary_storylines": "work_storylines",
+    "skills": "assessment_points",
+    "evaluated_skills": "assessment_points",
     "errors": "assessment_points",
-    "segment_ideas": "preliminary_storylines",
+    "segment_ideas": "work_storylines",
     "passport": "scenario_passport",
     "training_mode": "training_scenes",
     "diagnostic_mode": "diagnostic_scenes",
@@ -267,10 +262,34 @@ def append_section_items(
     return created
 
 
-def item_field_template(section_items: list[Any]) -> dict[str, Any]:
+_SECTION_ITEM_DEFAULTS: dict[str, dict[str, Any]] = {
+    "work_storylines": {"story_steps": [], "attention_focus": ""},
+    "assessment_points": {"visual_cues": [], "error_observation": "", "correct_observation": ""},
+    "expert_questions": {"why_needed": "", "answer": ""},
+    "training_scenes": {
+        "actors": "",
+        "location": "",
+        "frames": [],
+        "audio_text": "",
+        "regulations": "",
+        "props": "",
+    },
+    "diagnostic_scenes": {
+        "actors": "",
+        "location": "",
+        "frames": [],
+        "violation_categories": [],
+        "regulations": "",
+        "props": "",
+    },
+}
+
+
+def item_field_template(section_items: list[Any], section_id: str = "") -> dict[str, Any]:
     """Empty field shell matching the first sibling item in a section."""
-    skip = {"id", "status", "items", "frames", "segments"}
+    skip = {"id", "status"}
     template: dict[str, Any] = {"title": "", "description": ""}
+    template.update(_SECTION_ITEM_DEFAULTS.get(section_id, {}))
     for item in section_items:
         if not isinstance(item, dict):
             continue
@@ -281,8 +300,31 @@ def item_field_template(section_items: list[Any]) -> dict[str, Any]:
                 template.setdefault(key, "")
             elif isinstance(value, (int, float)):
                 template.setdefault(key, value)
+            elif isinstance(value, list):
+                template.setdefault(key, [])
         break
     return template
+
+
+def extract_expert_qa(content: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expert questions with answers; empty answer becomes an explicit placeholder."""
+    items: list[dict[str, Any]] = []
+    for section in content.get("sections") or []:
+        if not isinstance(section, dict) or section.get("id") != "expert_questions":
+            continue
+        for it in section.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            answer = str(it.get("answer") or "").strip()
+            items.append(
+                {
+                    "title": it.get("title") or "",
+                    "description": it.get("description") or "",
+                    "why_needed": it.get("why_needed") or "",
+                    "answer": answer if answer else "ответа нет",
+                }
+            )
+    return items
 
 
 def document_outline(content: dict[str, Any]) -> list[dict[str, Any]]:

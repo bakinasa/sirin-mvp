@@ -94,6 +94,9 @@ export function BriefEditorPage() {
         });
         setBrief(saved);
         setSavedAt(new Date().toLocaleTimeString("ru"));
+        const nextSteps = await api<PipelineStep[]>(`/projects/${projectId}/pipeline`);
+        setSteps(nextSteps);
+        await queryClient.invalidateQueries({ queryKey: ["pipeline", projectId] });
       } finally {
         setSaving(false);
       }
@@ -117,6 +120,9 @@ export function BriefEditorPage() {
         });
         setProject(saved);
         setSavedAt(new Date().toLocaleTimeString("ru"));
+        const nextSteps = await api<PipelineStep[]>(`/projects/${projectId}/pipeline`);
+        setSteps(nextSteps);
+        await queryClient.invalidateQueries({ queryKey: ["pipeline", projectId] });
       } finally {
         setSaving(false);
       }
@@ -155,6 +161,9 @@ export function BriefEditorPage() {
         await api(`/projects/${projectId}/sources`, { method: "POST", body: fd });
       }
       await reloadSources();
+      const nextSteps = await api<PipelineStep[]>(`/projects/${projectId}/pipeline`);
+      setSteps(nextSteps);
+      await queryClient.invalidateQueries({ queryKey: ["pipeline", projectId] });
     } catch (e) {
       setMessage(`Загрузка не удалась: ${e}`);
     } finally {
@@ -210,6 +219,7 @@ export function BriefEditorPage() {
             Автосохранение · v{brief.version} · {brief.status}
             {savedAt && ` · сохранено ${savedAt}`}
             {saving && " · сохраняем…"}
+            {alreadyApproved && " · правки после утверждения помечают следующие шаги устаревшими"}
           </p>
         </div>
         <button className="btn-primary" onClick={approve} disabled={approving || alreadyApproved}>
@@ -245,17 +255,17 @@ export function BriefEditorPage() {
 
       {tab === "main" && (
         <div className="panel grid gap-5">
-          <Field label="Название проекта" value={project.title} disabled={alreadyApproved} onChange={(v) => {
+          <Field label="Название проекта" value={project.title} onChange={(v) => {
             const next = { ...project, title: v };
             setProject(next);
             scheduleProjectSave(next);
           }} />
-          <Field label="Заказчик" value={project.client_name} disabled={alreadyApproved} onChange={(v) => {
+          <Field label="Заказчик" value={project.client_name} onChange={(v) => {
             const next = { ...project, client_name: v };
             setProject(next);
             scheduleProjectSave(next);
           }} />
-          <Field label="Профессия" value={project.profession} disabled={alreadyApproved} onChange={(v) => {
+          <Field label="Профессия" value={project.profession} onChange={(v) => {
             const next = { ...project, profession: v };
             setProject(next);
             scheduleProjectSave(next);
@@ -263,7 +273,6 @@ export function BriefEditorPage() {
           <Field
             label="Рабочая операция"
             value={cj.work_operation || ""}
-            disabled={alreadyApproved}
             onChange={(v) => {
               const next = { ...brief, content_json: { ...cj, work_operation: v } };
               setBrief(next);
@@ -275,7 +284,6 @@ export function BriefEditorPage() {
             <select
               className="input"
               value={project.delivery_format || ""}
-              disabled={alreadyApproved}
               onChange={(e) => {
                 const next = { ...project, delivery_format: e.target.value };
                 setProject(next);
@@ -291,7 +299,6 @@ export function BriefEditorPage() {
           <Area
             label="Короткое описание задачи"
             value={cj.task_description || ""}
-            disabled={alreadyApproved}
             onChange={(v) => {
               const next = { ...brief, content_json: { ...cj, task_description: v } };
               setBrief(next);
@@ -301,7 +308,6 @@ export function BriefEditorPage() {
           <Area
             label="Ограничения"
             value={project.constraints}
-            disabled={alreadyApproved}
             onChange={(v) => {
               const next = { ...project, constraints: v };
               setProject(next);
@@ -312,7 +318,6 @@ export function BriefEditorPage() {
             label="Цели модуля"
             hint="Можно оставить почти как есть."
             value={cj.learning_objectives || DEFAULT_OBJECTIVES}
-            disabled={alreadyApproved}
             onChange={(v) => {
               const next = { ...brief, content_json: { ...cj, learning_objectives: v } };
               setBrief(next);
@@ -419,7 +424,6 @@ export function BriefEditorPage() {
           <Area
             label="Заметки после разговора с заказчиком"
             value={cj.customer_notes || cj.notes || ""}
-            disabled={alreadyApproved}
             onChange={(v) => {
               const next = { ...brief, content_json: { ...cj, customer_notes: v, notes: v } };
               setBrief(next);

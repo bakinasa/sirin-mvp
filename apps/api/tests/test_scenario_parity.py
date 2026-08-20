@@ -94,7 +94,9 @@ class ScenarioParityTests(unittest.TestCase):
     def test_compute_max_tokens_uses_remaining_context(self):
         model = type("M", (), {"provider_name": "OpenRouter", "base_url": "", "context_window": 128000})()
         tokens = compute_max_tokens(model, "system" * 100, "user" * 100)
+        # Above old hard 8192, but soft-capped so providers do not hang.
         self.assertGreater(tokens, 8192)
+        self.assertLessEqual(tokens, 16384)
 
     def test_skills_alias_normalized_to_assessment_points(self):
         doc = ensure_ids(

@@ -236,6 +236,17 @@ async def _call_model(
             assembled.get("user_message") or "",
             cap=output_cap,
         )
+    if timeout_seconds is None:
+        timeout_seconds = (
+            280
+            if step_type
+            in (
+                StepType.PROFESSION_MAP.value,
+                StepType.SCENARIO_PLAN.value,
+                "source_summary",
+            )
+            else 120
+        )
     req = GenerateRequest(
         model=model.model_id,
         system=assembled["system_prompt"],
@@ -243,7 +254,7 @@ async def _call_model(
         temperature=0.0 if step_type == "source_summary" else (temperature if temperature is not None else 0.2),
         max_tokens=max_tokens,
         response_json=response_json,
-        timeout_seconds=timeout_seconds or 120,
+        timeout_seconds=timeout_seconds,
         extra_body=extra_body or {},
         assistant_prefill=assistant_prefill,
     )

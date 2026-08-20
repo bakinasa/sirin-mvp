@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
   api,
   Artifact,
@@ -16,6 +16,11 @@ import { ModelSelector } from "./ModelSelector";
 import { PromptPanel } from "./PromptPanel";
 import { SceneCard, StringListEditor } from "./SceneCard";
 import { exportDocx } from "../lib/docxExport";
+import {
+  getUnansweredExpertQuestions,
+  isAssessmentSection,
+  syncSectionIdAfterArtifact,
+} from "../lib/expertQuestions";
 
 type Props = {
   projectId: string;
@@ -45,6 +50,7 @@ export function StageWorkspace({
   const [operatorPrompt, setOperatorPrompt] = useState("");
   const [helpOpen, setHelpOpen] = useState(true);
   const [comments, setComments] = useState<CommentThread[]>([]);
+  const [mapArtifact, setMapArtifact] = useState<Artifact | null>(null);
   const saveTimer = useRef<number | null>(null);
   const pendingSaveItemRef = useRef<DocItem | null>(null);
   const autoSaveInFlight = useRef(false);
@@ -55,18 +61,36 @@ export function StageWorkspace({
   const outdated = step?.status === "outdated";
 
   async function reload() {
-    const [s, art] = await Promise.all([
+    const requests: Promise<unknown>[] = [
       api<PipelineStep[]>(`/projects/${projectId}/pipeline`),
       api<Artifact | null>(
         stageType === "profession_map"
           ? `/projects/${projectId}/profession-map`
           : `/projects/${projectId}/scenario`
       ),
-    ]);
+    ];
+    if (stageType === "scenario_plan") {
+      requests.push(api<Artifact | null>(`/projects/${projectId}/profession-map`));
+    }
+    const results = await Promise.all(requests);
+    const s = results[0] as PipelineStep[];
+    const art = results[1] as Artifact | null;
     setSteps(s);
+    applyArtifact(art);
+    if (stageType === "scenario_plan") {
+      setMapArtifact((results[2] as Artifact | null) ?? null);
+    }
+  }
+
+  function applyArtifact(art: Artifact | null) {
     setArtifact(art);
     const doc = asDoc(art?.content);
-    if (!sectionId && doc.sections?.[0]) setSectionId(doc.sections[0].id);
+    const nextSections = doc.sections || [];
+    setSectionId((prev) => {
+      if (nextSections.length === 0) return prev;
+      if (!prev && nextSections[0]) return nextSections[0].id;
+      return syncSectionIdAfterArtifact(nextSections, prev);
+    });
   }
 
   useEffect(() => {
@@ -163,6 +187,11 @@ export function StageWorkspace({
     }
   }
 
+  const unansweredExpertQuestions = useMemo(
+    () => getUnansweredExpertQuestions(mapArtifact?.content),
+    [mapArtifact?.content]
+  );
+
   function scheduleItemSave(item: DocItem) {
     if (!artifact) return;
     pendingSaveItemRef.current = item;
@@ -172,15 +201,19 @@ export function StageWorkspace({
       pendingSaveItemRef.current = null;
       saveTimer.current = null;
       if (!latest) return;
-      const path =
-        stageType === "profession_map"
-          ? `/projects/${projectId}/profession-map/items/${latest.id}`
-          : `/projects/${projectId}/scenario/items/${latest.id}`;
-      const updated = await api<Artifact>(path, {
-        method: "PATCH",
-        body: JSON.stringify({ content: latest }),
-      });
-      setArtifact(updated);
+      try {
+        const path =
+          stageType === "profession_map"
+            ? `/projects/${projectId}/profession-map/items/${latest.id}`
+            : `/projects/${projectId}/scenario/items/${latest.id}`;
+        const updated = await api<Artifact>(path, {
+          method: "PATCH",
+          body: JSON.stringify({ content: latest }),
+        });
+        applyArtifact(updated);
+      } catch (e) {
+        setError(String(e));
+      }
     }, 700);
   }
 
@@ -191,38 +224,45 @@ export function StageWorkspace({
     saveTimer.current = null;
     pendingSaveItemRef.current = null;
 
-    const path =
-      stageType === "profession_map"
-        ? `/projects/${projectId}/profession-map/items/${latest.id}`
-        : `/projects/${projectId}/scenario/items/${latest.id}`;
-    const updated = await api<Artifact>(path, {
-      method: "PATCH",
-      body: JSON.stringify({ content: latest }),
-    });
-    setArtifact(updated);
+    try {
+      const path =
+        stageType === "profession_map"
+          ? `/projects/${projectId}/profession-map/items/${latest.id}`
+          : `/projects/${projectId}/scenario/items/${latest.id}`;
+      const updated = await api<Artifact>(path, {
+        method: "PATCH",
+        body: JSON.stringify({ content: latest }),
+      });
+      applyArtifact(updated);
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function decide(itemId: string, kind: "accept" | "reject") {
-    const updated = await api<Artifact>(
-      `/projects/${projectId}/profession-map/items/${itemId}/${kind}`,
-      { method: "POST" }
-    );
-    setArtifact(updated);
+    try {
+      const updated = await api<Artifact>(
+        `/projects/${projectId}/profession-map/items/${itemId}/${kind}`,
+        { method: "POST" }
+      );
+      applyArtifact(updated);
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function freeze() {
     setBusy(true);
     try {
       await flushScheduledItemSave();
-      // Ensure everything is persisted before locking the step.
-      await saveVersion();
+      await saveVersion(true);
       const updated = await api<Artifact>(
         stageType === "profession_map"
           ? `/projects/${projectId}/profession-map/freeze`
           : `/projects/${projectId}/scenario/freeze`,
         { method: "POST", body: JSON.stringify({ change_summary: "Freeze" }) }
       );
-      setArtifact(updated);
+      applyArtifact(updated);
       await reload();
       if (stageType === "profession_map") {
         navigate(`/projects/${projectId}/scenario`);
@@ -234,13 +274,13 @@ export function StageWorkspace({
     }
   }
 
-  async function saveVersion() {
+  async function saveVersion(skipReload = false) {
     if (!artifact) return;
     await api(`/artifacts/${artifact.id}/save-version`, {
       method: "POST",
       body: JSON.stringify({ change_summary: "Manual snapshot" }),
     });
-    await reload();
+    if (!skipReload) await reload();
   }
 
   async function exportStoryDocx() {
@@ -375,6 +415,29 @@ export function StageWorkspace({
       {outdated && stageType === "scenario_plan" && (
         <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">
           Предсценарный сюжет изменился. Этот сценарий устарел — пересоберите его. Артефакт сохранён.
+        </div>
+      )}
+      {stageType === "scenario_plan" && unansweredExpertQuestions.length > 0 && (
+        <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">
+          <p className="font-semibold">Вопросы экспертам без ответа</p>
+          <p className="mt-1 text-xs text-neutral-600 dark:text-neutral-400">
+            Могут повлиять на генерацию сценария
+          </p>
+          <ul className="mt-2 space-y-2">
+            {unansweredExpertQuestions.map((q) => (
+              <li key={q.title}>
+                <span className="font-medium">{q.title}</span>
+                {q.why_needed && (
+                  <span className="text-neutral-600 dark:text-neutral-400"> — {q.why_needed}</span>
+                )}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 text-xs">
+            <Link to={`/projects/${projectId}/profession-map`} className="underline hover:no-underline">
+              Перейти к сюжету → вопросы экспертам
+            </Link>
+          </p>
         </div>
       )}
       {error && (
@@ -724,7 +787,8 @@ function ItemCard({
   onAccept: () => void;
   onReject: () => void;
 }) {
-  const isAssessment = sectionId === "assessment_points";
+  const isAssessment =
+    isAssessmentSection(sectionId) || Array.isArray(item.errors);
   // fields to render as generic inputs (skip errors[] and the migrated flat fields)
   const skip = new Set(["id", "status", "items", "frames", "segments", "errors", "error_observation", "correct_observation", "visual_cues"]);
   const fields = Object.keys(item).filter((k) => !skip.has(k));

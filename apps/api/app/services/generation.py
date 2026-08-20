@@ -15,10 +15,11 @@ from app.domain.enums import ArtifactStatus, ChangeType, RunStatus, StepStatus, 
 from app.llm.registry import build_provider
 from app.models import Artifact, PipelineRun, PipelineStep, PromptEditHistory, UserModel
 from app.security.crypto import decrypt_secret
-from app.services.document import ensure_ids
+from app.services.document import ensure_ids, validate_scenario_parity
 from app.services.json_content import parse_llm_json_content
 from app.services.pipeline_gate import assert_can_run_step
 from app.services.prompt_assembler import assemble_prompt
+from app.services.token_budget import compute_max_tokens
 from app.llm.base import GenerateRequest
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,20 @@ async def execute_run(db: AsyncSession, run_id: UUID) -> PipelineRun:
     if step.step_type in (StepType.PROFESSION_MAP.value, StepType.SCENARIO_PLAN.value):
         content = ensure_ids(content, step.step_type)
 
+    if step.step_type == StepType.SCENARIO_PLAN.value:
+        pm = await _latest_map_artifact(db, run.project_id)
+        if pm and isinstance(pm.content, dict):
+            map_content = ensure_ids(pm.content, StepType.PROFESSION_MAP.value)
+            parity_warnings = validate_scenario_parity(map_content, content)
+            if parity_warnings:
+                notes = content.setdefault("clarifications_needed", [])
+                if not isinstance(notes, list):
+                    notes = []
+                    content["clarifications_needed"] = notes
+                for note in parity_warnings:
+                    if note not in notes:
+                        notes.append(note)
+
     run.finished_at = datetime.now(timezone.utc)
 
     # Version artifact
@@ -208,15 +223,18 @@ async def _call_model(
         model.provider_type, model.provider_name, model.base_url, model.capabilities_json
     )
     if max_tokens is None:
-        max_tokens = (
-            8192
-            if step_type
-            in (
-                StepType.PROFESSION_MAP.value,
-                StepType.SCENARIO_PLAN.value,
-                "source_summary",
-            )
-            else 4096
+        output_cap = None
+        if step_type not in (
+            StepType.PROFESSION_MAP.value,
+            StepType.SCENARIO_PLAN.value,
+            "source_summary",
+        ):
+            output_cap = 4096
+        max_tokens = compute_max_tokens(
+            model,
+            assembled.get("system_prompt") or "",
+            assembled.get("user_message") or "",
+            cap=output_cap,
         )
     req = GenerateRequest(
         model=model.model_id,
@@ -265,6 +283,31 @@ async def _resolve_models(
                 break
 
     return primary, fallback
+
+
+async def _latest_map_artifact(db: AsyncSession, project_id: UUID) -> Artifact | None:
+    step = (
+        await db.execute(
+            select(PipelineStep).where(
+                PipelineStep.project_id == project_id,
+                PipelineStep.step_type == StepType.PROFESSION_MAP.value,
+            )
+        )
+    ).scalar_one_or_none()
+    if step and step.current_artifact_id:
+        art = await db.get(Artifact, step.current_artifact_id)
+        if art:
+            return art
+    result = await db.execute(
+        select(Artifact)
+        .where(
+            Artifact.project_id == project_id,
+            Artifact.step_type == StepType.PROFESSION_MAP.value,
+        )
+        .order_by(Artifact.version.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
 
 
 async def _next_version(db: AsyncSession, project_id: UUID, step_type: str) -> int:

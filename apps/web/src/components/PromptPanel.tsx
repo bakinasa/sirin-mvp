@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 
 type PreviewBlock = {
@@ -17,6 +17,16 @@ type Preview = {
   user_message?: string;
 };
 
+type OperatorPreset = {
+  id: string;
+  step_type: string;
+  title: string;
+  content: string;
+  is_default: boolean;
+};
+
+type SaveStatus = "saved" | "unsaved" | "saving";
+
 type Props = {
   projectId: string;
   stepType: string;
@@ -33,7 +43,6 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
   const [system, setSystem] = useState("");
   const [blocks, setBlocks] = useState<PreviewBlock[]>([]);
   const [version, setVersion] = useState("");
-  const [defaultOp, setDefaultOp] = useState("");
   const [userMessage, setUserMessage] = useState("");
   const [open, setOpen] = useState({
     system: false,
@@ -42,11 +51,29 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
     full: false,
   });
   const [history, setHistory] = useState<{ content: string; created_at: string }[]>([]);
-  const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const lastSavedRef = useRef("");
+  const readyRef = useRef(false);
+  const valueRef = useRef(value);
+  valueRef.current = value;
 
-  async function loadPreview() {
+  async function persist(content: string, type: string = stepType) {
+    await api<OperatorPreset>(
+      `/operator-prompt-presets/default?step_type=${encodeURIComponent(type)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ content }),
+      }
+    );
+    if (type === stepType) {
+      lastSavedRef.current = content;
+      setSaveStatus("saved");
+    }
+  }
+
+  async function loadPreview(overwriteOperator: boolean) {
     setLoading(true);
     setError("");
     try {
@@ -56,9 +83,13 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
       setSystem(preview.system_prompt);
       setBlocks(preview.blocks || []);
       setVersion(preview.prompt_template_version);
-      setDefaultOp(preview.operator_prompt);
       setUserMessage(preview.user_message || preview.context_text || "");
-      if (!value) onChange(preview.operator_prompt);
+      if (overwriteOperator) {
+        lastSavedRef.current = preview.operator_prompt;
+        onChange(preview.operator_prompt);
+        setSaveStatus("saved");
+        readyRef.current = true;
+      }
 
       const hist = await api<{ content: string; created_at: string }[]>(
         `/projects/${projectId}/prompt-history?step_type=${encodeURIComponent(stepType)}`
@@ -72,26 +103,72 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
   }
 
   useEffect(() => {
-    loadPreview().catch(console.error);
+    readyRef.current = false;
+    void loadPreview(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, stepType]);
 
-  async function savePreset() {
-    setSaving(true);
-    try {
-      await api("/operator-prompt-presets", {
-        method: "POST",
-        body: JSON.stringify({
-          step_type: stepType,
-          title: `Custom ${new Date().toLocaleString("ru")}`,
-          content: value,
-          is_default: false,
-        }),
+  useEffect(() => {
+    if (readOnly || !readyRef.current) return;
+    if (value === lastSavedRef.current) {
+      setSaveStatus("saved");
+      return;
+    }
+    setSaveStatus("unsaved");
+    const timer = window.setTimeout(() => {
+      setSaveStatus("saving");
+      persist(value).catch((e) => {
+        setError(String(e));
+        setSaveStatus("unsaved");
       });
-    } finally {
-      setSaving(false);
+    }, 700);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, stepType, readOnly]);
+
+  useEffect(() => {
+    return () => {
+      if (readOnly || !readyRef.current) return;
+      const text = valueRef.current;
+      if (text === lastSavedRef.current) return;
+      const path = `/operator-prompt-presets/default?step_type=${encodeURIComponent(stepType)}`;
+      void api(path, { method: "PUT", body: JSON.stringify({ content: text }) }).catch(() => undefined);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, stepType, readOnly]);
+
+  async function saveNow() {
+    if (readOnly) return;
+    setSaveStatus("saving");
+    setError("");
+    try {
+      await persist(value);
+    } catch (e) {
+      setError(String(e));
+      setSaveStatus("unsaved");
     }
   }
+
+  async function resetToFactory() {
+    if (readOnly) return;
+    setSaveStatus("saving");
+    setError("");
+    try {
+      const row = await api<OperatorPreset>(
+        `/operator-prompt-presets/default/reset?step_type=${encodeURIComponent(stepType)}`,
+        { method: "POST" }
+      );
+      lastSavedRef.current = row.content;
+      onChange(row.content);
+      setSaveStatus("saved");
+    } catch (e) {
+      setError(String(e));
+      setSaveStatus("unsaved");
+    }
+  }
+
+  const statusLabel =
+    saveStatus === "saving" ? "Сохраняем…" : saveStatus === "unsaved" ? "Несохранено" : "Сохранено";
 
   return (
     <div className="panel space-y-3">
@@ -113,7 +190,12 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
           <span className="shrink-0 text-xs text-neutral-400">{expanded ? "свернуть" : "развернуть"}</span>
         </button>
         {expanded && (
-          <button type="button" className="btn-ghost" disabled={loading} onClick={() => void loadPreview()}>
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={loading}
+            onClick={() => void loadPreview(saveStatus === "saved")}
+          >
             {loading ? "Обновляем…" : "Обновить превью"}
           </button>
         )}
@@ -161,7 +243,7 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
 
           <Section
             title="3. Задача оператора"
-            hint="Можно править прямо здесь. Этот текст уйдёт в модель вместе с контекстом."
+            hint="Шаблон шага для всех проектов. Можно править здесь — сохраняется автоматически."
             open={open.operator}
             onToggle={() => setOpen((s) => ({ ...s, operator: !s.operator }))}
           >
@@ -171,18 +253,24 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
               disabled={readOnly}
               onChange={(e) => onChange(e.target.value)}
             />
-            <div className="mt-2 flex flex-wrap gap-2">
-              <button type="button" className="btn-ghost" onClick={() => onChange(defaultOp)}>
-                Сбросить к шаблону
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="btn-ghost"
+                disabled={readOnly || saveStatus === "saving"}
+                onClick={() => void saveNow()}
+              >
+                Сохранить
               </button>
               <button
                 type="button"
                 className="btn-ghost"
-                disabled={saving || readOnly}
-                onClick={() => void savePreset()}
+                disabled={readOnly || saveStatus === "saving"}
+                onClick={() => void resetToFactory()}
               >
-                Сохранить как preset
+                Сбросить к исходной задаче
               </button>
+              <span className="text-xs text-neutral-500">{statusLabel}</span>
             </div>
           </Section>
 

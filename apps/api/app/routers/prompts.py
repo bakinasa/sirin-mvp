@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import get_db
 from app.deps import get_current_user
 from app.models import OperatorPromptPreset, PromptTemplate, User
+from app.operator_preset_defaults import factory_operator_preset
 from app.schemas import (
     OperatorPresetCreate,
+    OperatorPresetDefaultUpdate,
     OperatorPresetOut,
     PromptTemplateCreate,
     PromptTemplateOut,
@@ -113,3 +115,67 @@ async def create_preset(
     await db.flush()
     await db.refresh(preset)
     return preset
+
+
+async def _get_default_preset(db: AsyncSession, step_type: str) -> OperatorPromptPreset | None:
+    result = await db.execute(
+        select(OperatorPromptPreset).where(
+            OperatorPromptPreset.step_type == step_type,
+            OperatorPromptPreset.is_default.is_(True),
+        )
+    )
+    return result.scalars().first()
+
+
+async def _upsert_default_preset(
+    db: AsyncSession, step_type: str, content: str, *, title: str | None = None
+) -> OperatorPromptPreset:
+    row = await _get_default_preset(db, step_type)
+    factory = factory_operator_preset(step_type)
+    resolved_title = title or (factory["title"] if factory else "Задача оператора")
+    if row is None:
+        row = OperatorPromptPreset(
+            step_type=step_type,
+            title=resolved_title,
+            content=content,
+            is_default=True,
+        )
+        db.add(row)
+    else:
+        row.content = content
+        if title:
+            row.title = title
+    await db.flush()
+    await db.refresh(row)
+    return row
+
+
+@router.put("/operator-prompt-presets/default", response_model=OperatorPresetOut)
+async def upsert_default_preset(
+    step_type: str,
+    body: OperatorPresetDefaultUpdate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _ = user
+    if not step_type.strip():
+        raise HTTPException(400, "step_type обязателен")
+    return await _upsert_default_preset(db, step_type.strip(), body.content)
+
+
+@router.post("/operator-prompt-presets/default/reset", response_model=OperatorPresetOut)
+async def reset_default_preset(
+    step_type: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _ = user
+    factory = factory_operator_preset(step_type)
+    if factory is None:
+        raise HTTPException(404, f"Нет исходной задачи оператора для шага {step_type}")
+    return await _upsert_default_preset(
+        db,
+        step_type,
+        str(factory["content"]),
+        title=str(factory["title"]),
+    )

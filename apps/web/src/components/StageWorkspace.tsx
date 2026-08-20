@@ -15,6 +15,7 @@ import { StatusBadge } from "./StatusBadge";
 import { ModelSelector } from "./ModelSelector";
 import { PromptPanel } from "./PromptPanel";
 import { SceneCard, StringListEditor } from "./SceneCard";
+import { exportDocx } from "../lib/docxExport";
 
 type Props = {
   projectId: string;
@@ -242,6 +243,21 @@ export function StageWorkspace({
     await reload();
   }
 
+  async function exportStoryDocx() {
+    setBusy(true);
+    setError("");
+    try {
+      const job = await exportDocx(projectId, "docx_profession_map", "story.docx");
+      if (job.status === "failed") {
+        setError(job.error_message || "Не удалось сформировать DOCX");
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function newEdition() {
     if (!confirm("Создать новую редакцию сюжета? Сценарий будет помечен как устаревший.")) return;
     await api(`/projects/${projectId}/profession-map/new-edition`, { method: "POST" });
@@ -271,6 +287,11 @@ export function StageWorkspace({
           {stageType !== "profession_map" && stageType !== "scenario_plan" && (
             <button type="button" className="btn-ghost" onClick={() => setHistoryOpen(true)}>
               История
+            </button>
+          )}
+          {stageType === "profession_map" && artifact && (
+            <button type="button" className="btn-ghost" disabled={busy} onClick={() => void exportStoryDocx()}>
+              Скачать DOCX
             </button>
           )}
           <button type="button" className="btn-ghost" disabled={busy || !artifact} onClick={() => void freeze()}>

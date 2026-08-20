@@ -34,7 +34,6 @@ async def create_export(
         payload = await _collect(db, project)
 
         if export_type == ExportType.DOCX_SCENARIO.value:
-            # For DOCX we want the latest artifact regardless of approval status
             docx_payload = await _collect(db, project, approved_only=False)
             docx_bytes = _as_docx_scenario(docx_payload)
             content = {
@@ -42,6 +41,14 @@ async def create_export(
                 "filename": f"{project.title or 'scenario'}.docx",
             }
             path = f"exports/{project_id}/{job.id}.docx"
+        elif export_type == ExportType.DOCX_PROFESSION_MAP.value:
+            docx_payload = await _collect(db, project, approved_only=False)
+            docx_bytes = _as_docx_profession_map(docx_payload)
+            content = {
+                "docx_base64": base64.b64encode(docx_bytes).decode(),
+                "filename": f"{project.title or 'story'}_sujet.docx",
+            }
+            path = f"exports/{project_id}/{job.id}_story.docx"
         elif export_type == ExportType.JSON.value:
             content = payload
             path = f"exports/{project_id}/{job.id}.json"
@@ -336,6 +343,142 @@ def _as_docx_scenario(payload: dict) -> bytes:
 
             _regs(scene)
             _props(scene)
+            doc.add_paragraph()
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _as_docx_profession_map(payload: dict) -> bytes:
+    """Generate a DOCX document for the profession_map artifact."""
+    from docx import Document  # type: ignore[import-untyped]
+    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-untyped]
+    from docx.oxml import OxmlElement  # type: ignore[import-untyped]
+    from docx.oxml.ns import qn  # type: ignore[import-untyped]
+    from docx.shared import Pt, RGBColor  # type: ignore[import-untyped]
+
+    doc = Document()
+    doc.styles["Normal"].font.name = "Calibri"
+    doc.styles["Normal"].font.size = Pt(11)
+
+    def _heading(text: str, level: int = 1) -> None:
+        h = doc.add_heading(text, level=level)
+        if h.runs:
+            h.runs[0].font.color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+
+    def _kv(label: str, value: str) -> None:
+        p = doc.add_paragraph()
+        p.add_run(f"{label}: ").bold = True
+        p.add_run(value or "—")
+
+    def _shade_row(row) -> None:
+        for cell in row.cells:
+            tcPr = cell._tc.get_or_add_tcPr()
+            shd = OxmlElement("w:shd")
+            shd.set(qn("w:val"), "clear")
+            shd.set(qn("w:color"), "auto")
+            shd.set(qn("w:fill"), "D9D9D9")
+            tcPr.append(shd)
+
+    def _make_table(headers: list[str]) -> object:
+        tbl = doc.add_table(rows=1, cols=len(headers))
+        tbl.style = "Table Grid"
+        hdr = tbl.rows[0]
+        for i, h in enumerate(headers):
+            cell = hdr.cells[i]
+            cell.text = h
+            for run in cell.paragraphs[0].runs:
+                run.bold = True
+        _shade_row(hdr)
+        return tbl
+
+    def _add_row(tbl, values: list[str]) -> None:
+        row = tbl.add_row()
+        for i, val in enumerate(values):
+            row.cells[i].text = str(val or "")
+
+    proj = payload.get("project") or {}
+    title_par = doc.add_heading(proj.get("title") or "Сюжет и точки оценки", 0)
+    title_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph()
+    sub = doc.add_paragraph()
+    sub.add_run("Сюжет и точки оценки (промежуточная версия)").italic = True
+    doc.add_paragraph()
+    for label, key in [
+        ("Заказчик", "client_name"),
+        ("Профессия", "profession"),
+        ("Аудитория", "audience"),
+    ]:
+        if proj.get(key):
+            _kv(label, proj[key])
+    doc.add_page_break()
+
+    artifacts = payload.get("artifacts") or {}
+    content = (artifacts.get("profession_map") or {}).get("content") or {}
+    sections = content.get("sections") or []
+
+    story_items: list[dict] = []
+    assessment_items: list[dict] = []
+    question_items: list[dict] = []
+    for sec in sections:
+        sid = sec.get("id", "")
+        if sid == "work_storylines":
+            story_items = sec.get("items") or []
+        elif sid == "assessment_points":
+            assessment_items = sec.get("items") or []
+        elif sid == "expert_questions":
+            question_items = sec.get("items") or []
+
+    if story_items:
+        _heading("Варианты работ и сюжет", level=1)
+        for item in story_items:
+            _heading(item.get("title") or "Вид работ", level=2)
+            if item.get("description"):
+                _kv("Описание", item["description"])
+            steps = item.get("story_steps") or []
+            if steps:
+                doc.add_paragraph().add_run("Шаги сюжета:").bold = True
+                for step in steps:
+                    doc.add_paragraph(str(step), style="List Number")
+            if item.get("attention_focus"):
+                _kv("Фокус внимания", str(item["attention_focus"]))
+            doc.add_paragraph()
+
+    if assessment_items:
+        doc.add_page_break()
+        _heading("Навыки и точки оценки", level=1)
+        for item in assessment_items:
+            _heading(item.get("title") or "Вид работ", level=2)
+            if item.get("description"):
+                _kv("Контекст", item["description"])
+            errors = item.get("errors") or []
+            if errors:
+                doc.add_paragraph().add_run("Ошибки:").bold = True
+                tbl = _make_table(["Ошибка", "Правильно", "Визуальные признаки"])
+                for err in errors:
+                    if not isinstance(err, dict):
+                        continue
+                    cues = err.get("visual_cues") or []
+                    if isinstance(cues, list):
+                        cues_text = "; ".join(str(x) for x in cues)
+                    else:
+                        cues_text = str(cues)
+                    _add_row(tbl, [err.get("error") or "", err.get("correct") or "", cues_text])
+                doc.add_paragraph()
+
+    if question_items:
+        doc.add_page_break()
+        _heading("Вопросы экспертам", level=1)
+        for item in question_items:
+            _heading(item.get("title") or "Вопрос", level=2)
+            if item.get("description"):
+                _kv("Контекст", item["description"])
+            if item.get("why_needed"):
+                _kv("Зачем нужен ответ", item["why_needed"])
+            answer = item.get("answer")
+            if answer:
+                _kv("Ответ эксперта", str(answer))
             doc.add_paragraph()
 
     buf = io.BytesIO()

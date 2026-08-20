@@ -8,6 +8,9 @@ CHARS_PER_TOKEN = 2.4
 GROQ_REQUEST_TOKEN_BUDGET = 11000
 RESERVE_TOKENS = 512
 MIN_OUTPUT_TOKENS = 2048
+# Soft ceiling for long JSON docs (scenario with 4–10 scenes). Uncapped
+# context_window − prompt can be 100k+ and makes providers hang / 504.
+PIPELINE_OUTPUT_CAP = 16384
 
 # Context blocks passed to the LLM in full — never truncated in render_context_as_text.
 FULL_CONTEXT_BLOCK_IDS = frozenset(
@@ -42,7 +45,11 @@ def request_token_budget(model: Any) -> int:
 
 
 def compute_max_tokens(model: Any, system: str, user: str, *, cap: int | None = None) -> int:
-    """Output budget = remaining context after prompt, without artificial 8192 cap."""
+    """Output budget = remaining context after prompt, with a soft pipeline ceiling.
+
+    We no longer hard-cap at 8192, but we also must not request 50k–100k completion
+    tokens — gateways then run for minutes and nginx returns Gateway Time-out.
+    """
     input_tokens = estimate_tokens(system) + estimate_tokens(user)
     if is_tight_token_limit(model):
         remaining = GROQ_REQUEST_TOKEN_BUDGET - input_tokens - 256
@@ -51,6 +58,9 @@ def compute_max_tokens(model: Any, system: str, user: str, *, cap: int | None = 
         ctx = request_token_budget(model)
         remaining = ctx - input_tokens - RESERVE_TOKENS
         result = max(MIN_OUTPUT_TOKENS, remaining)
+        # Default soft ceiling when caller does not pass a tighter cap.
+        if cap is None:
+            result = min(PIPELINE_OUTPUT_CAP, result)
     if cap is not None:
         return min(cap, result)
     return result

@@ -50,7 +50,6 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
     operator: false,
     full: false,
   });
-  const [history, setHistory] = useState<{ content: string; created_at: string }[]>([]);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("saved");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -90,11 +89,6 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
         setSaveStatus("saved");
         readyRef.current = true;
       }
-
-      const hist = await api<{ content: string; created_at: string }[]>(
-        `/projects/${projectId}/prompt-history?step_type=${encodeURIComponent(stepType)}`
-      );
-      setHistory(hist);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -284,25 +278,6 @@ export function PromptPanel({ projectId, stepType, value, onChange, readOnly }: 
               {userMessage || "Нажмите «Обновить превью», чтобы увидеть полный текст."}
             </pre>
           </Section>
-
-          {history.length > 0 && (
-            <div>
-              <p className="label">История задач оператора</p>
-              <ul className="space-y-2 text-sm">
-                {history.slice(0, 5).map((h, i) => (
-                  <li key={i}>
-                    <button
-                      type="button"
-                      className="text-left underline"
-                      onClick={() => onChange(h.content)}
-                    >
-                      {new Date(h.created_at).toLocaleString("ru")} — восстановить
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
         </>
       )}
     </div>

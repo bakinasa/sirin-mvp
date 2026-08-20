@@ -404,6 +404,7 @@ export function StageWorkspace({
         />
       </div>
 
+      {stageType === "profession_map" && (
       <div className="mb-4 rounded-xl border border-neutral-200 bg-neutral-50 px-4 py-3 dark:border-neutral-700 dark:bg-neutral-900/50">
         <button
           type="button"
@@ -426,8 +427,7 @@ export function StageWorkspace({
             </li>
             <li>
               <b>В центре</b> кликните карточку, чтобы править точечно. Поля карточки можно менять руками.
-              Разделы слева фиксированы: для сюжета — работы и сюжет, точки оценки, вопросы экспертам;
-              для сценария — обучающие и диагностические сцены.
+              Разделы слева фиксированы: работы и сюжет, точки оценки, вопросы экспертам.
             </li>
             <li>
               Справа: ввод → ниже <b>режим</b> (вопрос / правка цели / всё / коммент. / пункт) и <b>модель</b>.
@@ -443,6 +443,7 @@ export function StageWorkspace({
           </ul>
         )}
       </div>
+      )}
 
       {parseWarnings.length > 0 && (
         <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">

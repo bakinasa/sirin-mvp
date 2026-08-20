@@ -116,7 +116,13 @@ class OpenAICompatibleProvider:
         url = f"{self.base_url}/chat/completions"
         body = _build_chat_body(self.base_url, request, self._supports_structured)
         started = time.perf_counter()
-        async with httpx.AsyncClient(timeout=float(request.timeout_seconds)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                float(request.timeout_seconds),
+                connect=30.0,
+                write=60.0,
+            )
+        ) as client:
             resp = await client.post(url, headers=self._headers(api_key), json=body)
             if resp.status_code >= 400:
                 stripped = _strip_unsupported_fields(body, resp.text)

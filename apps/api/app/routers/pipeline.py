@@ -51,7 +51,7 @@ async def run_pipeline_step(
     user: User = Depends(get_current_user),
 ):
     try:
-        run = await create_pipeline_run(
+        return await create_pipeline_run(
             db,
             project_id=project_id,
             user_id=user.id,
@@ -59,12 +59,26 @@ async def run_pipeline_step(
             operator_prompt=body.operator_prompt,
             primary_model_id=body.primary_model_id,
             fallback_model_id=body.fallback_model_id,
+            wait=False,
         )
-        return run
     except PipelineGateError as exc:
         raise HTTPException(400, exc.message) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, str(exc)) from exc
+
+
+@router.get("/projects/{project_id}/pipeline/runs/{run_id}", response_model=PipelineRunOut)
+async def get_run(
+    project_id: UUID,
+    run_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _ = user
+    run = await db.get(PipelineRun, run_id)
+    if run is None or run.project_id != project_id:
+        raise HTTPException(404, "Run not found")
+    return run
 
 
 @router.get("/projects/{project_id}/pipeline/runs", response_model=list[PipelineRunOut])
@@ -169,6 +183,7 @@ async def regenerate(
             operator_prompt=body.operator_prompt if body else None,
             primary_model_id=body.primary_model_id if body else None,
             fallback_model_id=body.fallback_model_id if body else None,
+            wait=False,
         )
     except PipelineGateError as exc:
         raise HTTPException(400, exc.message) from exc

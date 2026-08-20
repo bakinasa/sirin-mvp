@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timezone
 from uuid import UUID
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -126,6 +127,40 @@ async def set_item_decision(
     artifact = await _editable_artifact(db, project_id, step_type)
     content = copy.deepcopy(artifact.content) if isinstance(artifact.content, dict) else {}
     if not set_item_status(content, item_id, status):
+        raise StageEditError(f"Элемент {item_id} не найден")
+    _normalize_and_store(artifact, content, step_type)
+    artifact.status = ArtifactStatus.EDITED.value
+    await db.flush()
+    await db.refresh(artifact)
+    return artifact
+
+
+def _delete_item_from_sections(content: dict[str, Any], item_id: str) -> bool:
+    """Remove an item from any top-level section by item id."""
+    deleted = False
+    for section in content.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        items = section.get("items")
+        if not isinstance(items, list):
+            continue
+        before = len(items)
+        items = [it for it in items if not (isinstance(it, dict) and it.get("id") == item_id)]
+        if len(items) != before:
+            section["items"] = items
+            deleted = True
+    return deleted
+
+
+async def delete_item(
+    db: AsyncSession,
+    project_id: UUID,
+    step_type: str,
+    item_id: str,
+) -> Artifact:
+    artifact = await _editable_artifact(db, project_id, step_type)
+    content = copy.deepcopy(artifact.content) if isinstance(artifact.content, dict) else {}
+    if not _delete_item_from_sections(content, item_id):
         raise StageEditError(f"Элемент {item_id} не найден")
     _normalize_and_store(artifact, content, step_type)
     artifact.status = ArtifactStatus.EDITED.value

@@ -11,6 +11,7 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db import AsyncSessionLocal
 from app.domain.enums import ArtifactStatus, ChangeType, RunStatus, StepStatus, StepType
 from app.llm.registry import build_provider
 from app.models import Artifact, PipelineRun, PipelineStep, PromptEditHistory, UserModel
@@ -19,7 +20,10 @@ from app.services.document import ensure_ids, validate_scenario_parity
 from app.services.json_content import parse_llm_json_content
 from app.services.pipeline_gate import assert_can_run_step
 from app.services.prompt_assembler import assemble_prompt
-from app.services.token_budget import compute_max_tokens
+from app.services.token_budget import (
+    PIPELINE_GENERATE_TIMEOUT_SECONDS,
+    compute_max_tokens,
+)
 from app.llm.base import GenerateRequest
 
 logger = logging.getLogger(__name__)
@@ -34,26 +38,19 @@ async def create_pipeline_run(
     operator_prompt: Optional[str] = None,
     primary_model_id: Optional[UUID] = None,
     fallback_model_id: Optional[UUID] = None,
+    wait: bool = False,
 ) -> PipelineRun:
+    """Enqueue a generation run.
+
+    Default path (wait=False): commit QUEUED and return immediately so nginx/proxies
+    never wait on the LLM. The docker worker picks up queued runs.
+    """
     step = await assert_can_run_step(db, project_id, step_type)
     if step.status == StepStatus.LOCKED.value:
         step.status = StepStatus.UNDER_REVIEW.value
     from app.services.stages import mark_later_steps_outdated
 
     await mark_later_steps_outdated(db, project_id, step_type)
-
-    # Expert feedback is human-collected; no AI run needed to "complete" collection,
-    # but synthesis/other generative steps are AI.
-    assembled = await assemble_prompt(db, project_id, step_type, operator_prompt)
-
-    db.add(
-        PromptEditHistory(
-            project_id=project_id,
-            step_type=step_type,
-            editor_id=user_id,
-            content=assembled["operator_prompt"],
-        )
-    )
 
     primary, fallback = await _resolve_models(
         db,
@@ -64,52 +61,108 @@ async def create_pipeline_run(
         fallback_model_id,
     )
 
+    # Resolve operator text lightly; full prompt assembly happens in the worker.
+    from app.services.prompt_assembler import resolve_operator_prompt
+
+    op_text = await resolve_operator_prompt(db, step_type, operator_prompt)
+
+    db.add(
+        PromptEditHistory(
+            project_id=project_id,
+            step_type=step_type,
+            editor_id=user_id,
+            content=op_text,
+        )
+    )
+
     run = PipelineRun(
         project_id=project_id,
         pipeline_step_id=step.id,
         status=RunStatus.QUEUED.value,
         provider_name="",
         model_name=primary.model_id if primary else "",
-        prompt_template_version=assembled["prompt_template_version"],
-        operator_prompt_text=assembled["operator_prompt"],
+        prompt_template_version="",
+        operator_prompt_text=op_text,
         context_snapshot={
-            "bundle": assembled["context_bundle"],
-            "system_prompt": assembled["system_prompt"],
-            "output_schema": assembled["output_schema"],
             "primary_user_model_id": str(primary.id) if primary else None,
             "fallback_user_model_id": str(fallback.id) if fallback else None,
-            "user_message_preview": assembled["user_message"][:4000],
         },
     )
     db.add(run)
     await db.flush()
 
-    # Execute inline for MVP reliability (worker can also pick up queued jobs).
-    await execute_run(db, run.id)
+    if wait:
+        await execute_run(db, run.id)
+        await db.refresh(run)
+        return run
+
+    # Async path: commit queued run so the worker can claim it after HTTP returns.
+    await db.commit()
     await db.refresh(run)
     return run
 
 
-async def execute_run(db: AsyncSession, run_id: UUID) -> PipelineRun:
-    run = await db.get(PipelineRun, run_id)
+async def schedule_pipeline_run(run_id: UUID) -> None:
+    """Optional in-process fallback; prefers no-op if worker already claimed the run."""
+    try:
+        async with AsyncSessionLocal() as db:
+            try:
+                await execute_run(db, run_id)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Background pipeline run %s crashed: %s", run_id, exc)
+        async with AsyncSessionLocal() as db:
+            run = await db.get(PipelineRun, run_id)
+            if run and run.status in (RunStatus.QUEUED.value, RunStatus.RUNNING.value):
+                run.status = RunStatus.FAILED.value
+                run.error_message = str(exc)[:2000]
+                run.finished_at = datetime.now(timezone.utc)
+                await db.commit()
+
+
+async def execute_run(db: AsyncSession, run_id: UUID) -> PipelineRun | None:
+    """Claim a queued run and execute LLM generation. Returns None if already claimed."""
+    result = await db.execute(
+        select(PipelineRun).where(PipelineRun.id == run_id).with_for_update()
+    )
+    run = result.scalar_one_or_none()
     if run is None:
         raise ValueError("Run not found")
+    if run.status != RunStatus.QUEUED.value:
+        logger.info("Skip run %s — status is %s", run_id, run.status)
+        return None
 
     step = await db.get(PipelineStep, run.pipeline_step_id)
+    if step is None:
+        run.status = RunStatus.FAILED.value
+        run.error_message = "Pipeline step not found"
+        run.finished_at = datetime.now(timezone.utc)
+        await db.flush()
+        return run
+
+    run.status = RunStatus.RUNNING.value
+    run.started_at = datetime.now(timezone.utc)
+    await db.flush()
+
     assembled = await assemble_prompt(
         db, run.project_id, step.step_type, run.operator_prompt_text
     )
+    run.prompt_template_version = assembled.get("prompt_template_version") or ""
+    snap = dict(run.context_snapshot or {})
+    snap["bundle"] = assembled.get("context_bundle")
+    snap["system_prompt"] = assembled.get("system_prompt")
+    snap["output_schema"] = assembled.get("output_schema")
+    snap["user_message_preview"] = (assembled.get("user_message") or "")[:4000]
+    run.context_snapshot = snap
 
-    snap = run.context_snapshot or {}
     primary_id = snap.get("primary_user_model_id")
     fallback_id = snap.get("fallback_user_model_id")
 
     primary = await db.get(UserModel, UUID(primary_id)) if primary_id else None
     fallback = await db.get(UserModel, UUID(fallback_id)) if fallback_id else None
-
-    run.status = RunStatus.RUNNING.value
-    run.started_at = datetime.now(timezone.utc)
-    await db.flush()
 
     last_error = ""
     result = None
@@ -238,7 +291,7 @@ async def _call_model(
         )
     if timeout_seconds is None:
         timeout_seconds = (
-            280
+            PIPELINE_GENERATE_TIMEOUT_SECONDS
             if step_type
             in (
                 StepType.PROFESSION_MAP.value,

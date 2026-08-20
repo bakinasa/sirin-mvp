@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import {
   api,
   Artifact,
   BlockDocument,
   CommentThread,
   DocItem,
+  PipelineRun,
   PipelineStep,
+  waitForPipelineRun,
 } from "../lib/api";
 import { PipelineStepper } from "./PipelineStepper";
 import { AssistantPanel } from "./AssistantPanel";
@@ -15,9 +17,9 @@ import { StatusBadge } from "./StatusBadge";
 import { ModelSelector } from "./ModelSelector";
 import { PromptPanel } from "./PromptPanel";
 import { SceneCard, StringListEditor } from "./SceneCard";
+import { AssessmentCard } from "./AssessmentCard";
 import { exportDocx } from "../lib/docxExport";
 import {
-  getUnansweredExpertQuestions,
   isAssessmentSection,
   syncSectionIdAfterArtifact,
 } from "../lib/expertQuestions";
@@ -44,16 +46,18 @@ export function StageWorkspace({
   const [targetId, setTargetId] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [genStatus, setGenStatus] = useState("");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [primaryId, setPrimaryId] = useState("");
   const [fallbackId, setFallbackId] = useState("");
   const [operatorPrompt, setOperatorPrompt] = useState("");
   const [helpOpen, setHelpOpen] = useState(true);
   const [comments, setComments] = useState<CommentThread[]>([]);
-  const [mapArtifact, setMapArtifact] = useState<Artifact | null>(null);
   const saveTimer = useRef<number | null>(null);
   const pendingSaveItemRef = useRef<DocItem | null>(null);
   const autoSaveInFlight = useRef(false);
+  const artifactRef = useRef<Artifact | null>(null);
+  artifactRef.current = artifact;
 
   const step = steps.find((s) => s.step_type === stageType);
   const mapStep = steps.find((s) => s.step_type === "profession_map");
@@ -61,31 +65,30 @@ export function StageWorkspace({
   const outdated = step?.status === "outdated";
 
   async function reload() {
-    const requests: Promise<unknown>[] = [
+    const [s, art] = await Promise.all([
       api<PipelineStep[]>(`/projects/${projectId}/pipeline`),
       api<Artifact | null>(
         stageType === "profession_map"
           ? `/projects/${projectId}/profession-map`
           : `/projects/${projectId}/scenario`
       ),
-    ];
-    if (stageType === "scenario_plan") {
-      requests.push(api<Artifact | null>(`/projects/${projectId}/profession-map`));
-    }
-    const results = await Promise.all(requests);
-    const s = results[0] as PipelineStep[];
-    const art = results[1] as Artifact | null;
+    ]);
     setSteps(s);
     applyArtifact(art);
-    if (stageType === "scenario_plan") {
-      setMapArtifact((results[2] as Artifact | null) ?? null);
-    }
   }
 
   function applyArtifact(art: Artifact | null) {
+    artifactRef.current = art;
     setArtifact(art);
     const doc = asDoc(art?.content);
     const nextSections = doc.sections || [];
+    const allItemIds = new Set(
+      (nextSections || []).flatMap((s) => (Array.isArray(s.items) ? s.items : []).map((it) => it.id))
+    );
+    setTargetId((prev) => {
+      if (prev && allItemIds.has(prev)) return prev;
+      return "";
+    });
     setSectionId((prev) => {
       if (nextSections.length === 0) return prev;
       if (!prev && nextSections[0]) return nextSections[0].id;
@@ -118,6 +121,7 @@ export function StageWorkspace({
       if (autoSaveInFlight.current) return;
       autoSaveInFlight.current = true;
       try {
+        await flushScheduledItemSave();
         await api(`/artifacts/${artifact.id}/save-version`, {
           method: "POST",
           body: JSON.stringify({ change_summary: "Auto snapshot" }),
@@ -165,8 +169,9 @@ export function StageWorkspace({
   async function generate() {
     setBusy(true);
     setError("");
+    setGenStatus("Ставим задачу в очередь…");
     try {
-      await api(
+      const run = await api<PipelineRun>(
         stageType === "profession_map"
           ? `/projects/${projectId}/profession-map/generate`
           : `/projects/${projectId}/scenario/generate`,
@@ -179,38 +184,71 @@ export function StageWorkspace({
           }),
         }
       );
+      setGenStatus("Генерация в фоне (worker). Обычно 3–12 минут для полного сценария…");
+      await waitForPipelineRun(projectId, run.id, {
+        onTick: (r) => {
+          if (r.status === "queued") {
+            setGenStatus("В очереди worker…");
+          } else if (r.status === "running") {
+            setGenStatus("Модель генерирует полный документ…");
+          }
+        },
+      });
+      setGenStatus("");
       await reload();
     } catch (e) {
       setError(String(e));
+      setGenStatus("");
+      // Even on poll timeout the background job may still finish — refresh once.
+      try {
+        await reload();
+      } catch {
+        /* ignore */
+      }
     } finally {
       setBusy(false);
     }
   }
 
-  const unansweredExpertQuestions = useMemo(
-    () => getUnansweredExpertQuestions(mapArtifact?.content),
-    [mapArtifact?.content]
-  );
+  function handleItemChange(next: DocItem) {
+    const prev = artifactRef.current;
+    if (!prev) return;
+    const patched = patchItemInDoc(
+      prev.content,
+      next,
+      currentSection?.id || sectionId
+    );
+    if (!patched) {
+      setError("Не удалось обновить карточку в документе");
+      return;
+    }
+    setError("");
+    const updated = { ...prev, content: patched };
+    // Keep ref in sync before React re-renders so rapid keystrokes don't use a stale doc.
+    artifactRef.current = updated;
+    setArtifact(updated);
+    scheduleItemSave(next);
+  }
 
   function scheduleItemSave(item: DocItem) {
-    if (!artifact) return;
     pendingSaveItemRef.current = item;
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(async () => {
-      const latest = pendingSaveItemRef.current;
-      pendingSaveItemRef.current = null;
+      const toSave = pendingSaveItemRef.current;
       saveTimer.current = null;
-      if (!latest) return;
+      if (!toSave) return;
+      pendingSaveItemRef.current = null;
       try {
         const path =
           stageType === "profession_map"
-            ? `/projects/${projectId}/profession-map/items/${latest.id}`
-            : `/projects/${projectId}/scenario/items/${latest.id}`;
-        const updated = await api<Artifact>(path, {
+            ? `/projects/${projectId}/profession-map/items/${toSave.id}`
+            : `/projects/${projectId}/scenario/items/${toSave.id}`;
+        // Persist only. Do NOT replace local document with PATCH response —
+        // that overwrites newer keystrokes (especially nested tables like errors[] / frames[]).
+        await api<Artifact>(path, {
           method: "PATCH",
-          body: JSON.stringify({ content: latest }),
+          body: JSON.stringify({ content: toSave }),
         });
-        applyArtifact(updated);
       } catch (e) {
         setError(String(e));
       }
@@ -218,22 +256,29 @@ export function StageWorkspace({
   }
 
   async function flushScheduledItemSave() {
-    if (!saveTimer.current || !pendingSaveItemRef.current) return;
-    const latest = pendingSaveItemRef.current;
-    window.clearTimeout(saveTimer.current);
-    saveTimer.current = null;
+    if (!pendingSaveItemRef.current) {
+      if (saveTimer.current) {
+        window.clearTimeout(saveTimer.current);
+        saveTimer.current = null;
+      }
+      return;
+    }
+    const toSave = pendingSaveItemRef.current;
+    if (saveTimer.current) {
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = null;
+    }
     pendingSaveItemRef.current = null;
 
     try {
       const path =
         stageType === "profession_map"
-          ? `/projects/${projectId}/profession-map/items/${latest.id}`
-          : `/projects/${projectId}/scenario/items/${latest.id}`;
-      const updated = await api<Artifact>(path, {
+          ? `/projects/${projectId}/profession-map/items/${toSave.id}`
+          : `/projects/${projectId}/scenario/items/${toSave.id}`;
+      await api<Artifact>(path, {
         method: "PATCH",
-        body: JSON.stringify({ content: latest }),
+        body: JSON.stringify({ content: toSave }),
       });
-      applyArtifact(updated);
     } catch (e) {
       setError(String(e));
     }
@@ -241,6 +286,7 @@ export function StageWorkspace({
 
   async function decide(itemId: string, kind: "accept" | "reject") {
     try {
+      await flushScheduledItemSave();
       const updated = await api<Artifact>(
         `/projects/${projectId}/profession-map/items/${itemId}/${kind}`,
         { method: "POST" }
@@ -417,27 +463,9 @@ export function StageWorkspace({
           Предсценарный сюжет изменился. Этот сценарий устарел — пересоберите его. Артефакт сохранён.
         </div>
       )}
-      {stageType === "scenario_plan" && unansweredExpertQuestions.length > 0 && (
-        <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">
-          <p className="font-semibold">Вопросы экспертам без ответа</p>
-          <p className="mt-1 text-xs text-neutral-600 dark:text-neutral-400">
-            Могут повлиять на генерацию сценария
-          </p>
-          <ul className="mt-2 space-y-2">
-            {unansweredExpertQuestions.map((q) => (
-              <li key={q.title}>
-                <span className="font-medium">{q.title}</span>
-                {q.why_needed && (
-                  <span className="text-neutral-600 dark:text-neutral-400"> — {q.why_needed}</span>
-                )}
-              </li>
-            ))}
-          </ul>
-          <p className="mt-3 text-xs">
-            <Link to={`/projects/${projectId}/profession-map`} className="underline hover:no-underline">
-              Перейти к сюжету → вопросы экспертам
-            </Link>
-          </p>
+      {genStatus && (
+        <div className="mb-4 rounded-lg border border-sky-300 bg-sky-50 px-4 py-3 text-sm dark:border-sky-800 dark:bg-sky-950/40">
+          {genStatus}
         </div>
       )}
       {error && (
@@ -482,6 +510,7 @@ export function StageWorkspace({
             {(currentSection?.items || []).map((item) => {
               const isScene =
                 currentSection?.id === "training_scenes" || currentSection?.id === "diagnostic_scenes";
+              const isAssessment = isAssessmentSection(currentSection?.id);
               const cardProps = {
                 item,
                 selected: targetId === item.id,
@@ -489,25 +518,31 @@ export function StageWorkspace({
                 commentThreads: itemComments(item.id),
                 onResolveComment: (id: string) => void resolveComment(id),
                 onSelect: () => setTargetId(targetId === item.id ? "" : item.id),
-                onChange: (next: DocItem) => {
-                  const copy = structuredClone(doc) as BlockDocument;
-                  const sec = copy.sections?.find((s) => s.id === currentSection?.id);
-                  if (!sec) return;
-                  sec.items = sec.items.map((it) => (it.id === next.id ? next : it));
-                  setArtifact({ ...artifact, content: copy });
-                  scheduleItemSave(next);
-                },
+                onChange: handleItemChange,
               };
-              return isScene ? (
-                <SceneCard
-                  key={item.id}
-                  variant={currentSection?.id === "diagnostic_scenes" ? "diagnostic" : "training"}
-                  {...cardProps}
-                />
-              ) : (
+              if (isScene) {
+                return (
+                  <SceneCard
+                    key={item.id}
+                    variant={currentSection?.id === "diagnostic_scenes" ? "diagnostic" : "training"}
+                    {...cardProps}
+                  />
+                );
+              }
+              if (isAssessment) {
+                return (
+                  <AssessmentCard
+                    key={item.id}
+                    allowAcceptReject={!!allowAcceptReject}
+                    onAccept={() => void decide(item.id, "accept")}
+                    onReject={() => void decide(item.id, "reject")}
+                    {...cardProps}
+                  />
+                );
+              }
+              return (
                 <ItemCard
                   key={item.id}
-                  sectionId={currentSection?.id}
                   allowAcceptReject={!!allowAcceptReject}
                   onAccept={() => void decide(item.id, "accept")}
                   onReject={() => void decide(item.id, "reject")}
@@ -555,6 +590,26 @@ function asDoc(content: unknown): BlockDocument {
     return content as BlockDocument;
   }
   return { sections: [] };
+}
+
+/** Update one item in a document copy; finds section by preferred id or by item id. */
+function patchItemInDoc(
+  content: unknown,
+  next: DocItem,
+  preferredSectionId?: string
+): BlockDocument | null {
+  const copy = structuredClone(asDoc(content)) as BlockDocument;
+  const sections = copy.sections || [];
+  let sec =
+    preferredSectionId ? sections.find((s) => s.id === preferredSectionId) : undefined;
+  if (!sec || !sec.items?.some((it) => it.id === next.id)) {
+    sec = sections.find((s) => s.items?.some((it) => it.id === next.id));
+  }
+  if (!sec?.items) return null;
+  const hasItem = sec.items.some((it) => it.id === next.id);
+  if (!hasItem) return null;
+  sec.items = sec.items.map((it) => (it.id === next.id ? next : it));
+  return copy;
 }
 
 const FIELD_LABELS: Record<string, string> = {
@@ -635,136 +690,8 @@ function CommentBlock({
   );
 }
 
-type ErrorRow = { error: string; correct: string; visual_cues: string[] };
-
-function asErrors(item: DocItem): ErrorRow[] {
-  if (Array.isArray(item.errors)) {
-    return (item.errors as unknown[]).map((r) => {
-      const row = (r && typeof r === "object" ? r : {}) as Record<string, unknown>;
-      return {
-        error: String(row.error ?? ""),
-        correct: String(row.correct ?? ""),
-        visual_cues: Array.isArray(row.visual_cues) ? (row.visual_cues as unknown[]).map((x) => String(x ?? "")) : [],
-      };
-    });
-  }
-  // migrate from flat fields
-  const hasFlat = item.error_observation != null || item.correct_observation != null || item.visual_cues != null;
-  if (hasFlat) {
-    return [{
-      error: String(item.error_observation ?? ""),
-      correct: String(item.correct_observation ?? ""),
-      visual_cues: Array.isArray(item.visual_cues)
-        ? (item.visual_cues as unknown[]).map((x) => String(x ?? ""))
-        : typeof item.visual_cues === "string" && item.visual_cues ? [item.visual_cues] : [],
-    }];
-  }
-  return [];
-}
-
-function ErrorsTable({
-  item,
-  readOnly,
-  onChange,
-}: {
-  item: DocItem;
-  readOnly: boolean;
-  onChange: (item: DocItem) => void;
-}) {
-  const rows = asErrors(item);
-
-  function update(next: ErrorRow[]) {
-    const { error_observation: _e, correct_observation: _c, visual_cues: _v, ...rest } = item as DocItem & Record<string, unknown>;
-    void _e; void _c; void _v;
-    onChange({ ...rest, errors: next } as DocItem);
-  }
-
-  function setRow(idx: number, patch: Partial<ErrorRow>) {
-    update(rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
-  }
-
-  function addRow() {
-    update([...rows, { error: "", correct: "", visual_cues: [] }]);
-  }
-
-  function removeRow(idx: number) {
-    update(rows.filter((_, i) => i !== idx));
-  }
-
-  return (
-    <div onClick={(e) => e.stopPropagation()}>
-      <div className="mb-1 flex items-center justify-between">
-        <label className="label text-xs">Ошибки и правильные действия</label>
-        {!readOnly && (
-          <button type="button" className="btn-ghost px-2 py-0.5 text-xs" onClick={addRow}>
-            + ошибка
-          </button>
-        )}
-      </div>
-      <div className="overflow-x-auto rounded-lg border border-neutral-200 dark:border-neutral-700">
-        <table className="min-w-full text-left text-xs">
-          <thead className="bg-neutral-50 dark:bg-neutral-900">
-            <tr>
-              <th className="px-2 py-1.5 font-medium">Ошибка</th>
-              <th className="px-2 py-1.5 font-medium">Правильно</th>
-              <th className="px-2 py-1.5 font-medium">Визуальные признаки</th>
-              {!readOnly && <th className="w-8 px-1 py-1.5" />}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 && (
-              <tr>
-                <td className="px-2 py-2 text-neutral-400" colSpan={readOnly ? 3 : 4}>
-                  Нет ошибок. Добавьте строку.
-                </td>
-              </tr>
-            )}
-            {rows.map((row, idx) => (
-              <tr key={idx} className="border-t border-neutral-200 dark:border-neutral-800">
-                <td className="px-1 py-1 align-top">
-                  <textarea
-                    className="input min-h-[52px] text-xs"
-                    disabled={readOnly}
-                    placeholder="Что именно сделано неправильно"
-                    value={row.error}
-                    onChange={(e) => setRow(idx, { error: e.target.value })}
-                  />
-                </td>
-                <td className="px-1 py-1 align-top">
-                  <textarea
-                    className="input min-h-[52px] text-xs"
-                    disabled={readOnly}
-                    placeholder="Как надо делать"
-                    value={row.correct}
-                    onChange={(e) => setRow(idx, { correct: e.target.value })}
-                  />
-                </td>
-                <td className="px-1 py-1 align-top">
-                  <StringListEditor
-                    values={row.visual_cues}
-                    readOnly={readOnly}
-                    onChange={(values) => setRow(idx, { visual_cues: values })}
-                  />
-                </td>
-                {!readOnly && (
-                  <td className="px-1 py-1 align-top">
-                    <button type="button" className="btn-ghost px-1 py-0.5 text-xs" onClick={() => removeRow(idx)}>
-                      ×
-                    </button>
-                  </td>
-                )}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
 function ItemCard({
   item,
-  sectionId,
   selected,
   readOnly,
   allowAcceptReject,
@@ -776,7 +703,6 @@ function ItemCard({
   onReject,
 }: {
   item: DocItem;
-  sectionId?: string;
   selected: boolean;
   readOnly: boolean;
   allowAcceptReject: boolean;
@@ -787,10 +713,8 @@ function ItemCard({
   onAccept: () => void;
   onReject: () => void;
 }) {
-  const isAssessment =
-    isAssessmentSection(sectionId) || Array.isArray(item.errors);
-  // fields to render as generic inputs (skip errors[] and the migrated flat fields)
-  const skip = new Set(["id", "status", "items", "frames", "segments", "errors", "error_observation", "correct_observation", "visual_cues"]);
+  // Same simple pattern as Story / Questions: edit via `{ ...item, field: value }`.
+  const skip = new Set(["id", "status", "items", "frames", "segments", "errors"]);
   const fields = Object.keys(item).filter((k) => !skip.has(k));
   return (
     <article
@@ -801,13 +725,13 @@ function ItemCard({
         <div className="min-w-0 flex-1">
           {!readOnly ? (
             <div>
-              <label className="label text-xs">{isAssessment ? "Вид работ" : "title"}</label>
+              <label className="label text-xs">title</label>
               <input
                 className="input font-semibold"
                 value={String(item.title || "")}
                 onChange={(e) => onChange({ ...item, title: e.target.value })}
                 onClick={(e) => e.stopPropagation()}
-                placeholder={isAssessment ? "Название вида работ" : "Заголовок"}
+                placeholder="Заголовок"
               />
             </div>
           ) : (
@@ -837,7 +761,7 @@ function ItemCard({
         .filter((k) => k !== "title")
         .map((k) => (
           <div key={k}>
-            <label className="label text-xs">{isAssessment && k === "description" ? "Контекст" : FIELD_LABELS[k] || k}</label>
+            <label className="label text-xs">{FIELD_LABELS[k] || k}</label>
             {typeof item[k] === "string" || typeof item[k] === "number" || item[k] == null ? (
               <textarea
                 className="input min-h-[56px]"
@@ -859,9 +783,6 @@ function ItemCard({
             )}
           </div>
         ))}
-      {isAssessment && (
-        <ErrorsTable item={item} readOnly={readOnly} onChange={onChange} />
-      )}
       {Array.isArray(item.frames) && (
         <p className="text-xs text-neutral-500">Кадров: {(item.frames as unknown[]).length}</p>
       )}

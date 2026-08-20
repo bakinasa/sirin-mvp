@@ -39,6 +39,72 @@ export async function api<T>(
   return res.json();
 }
 
+export type PipelineRun = {
+  id: string;
+  project_id: string;
+  pipeline_step_id: string;
+  status: string;
+  provider_name: string;
+  model_name: string;
+  prompt_template_version: string;
+  operator_prompt_text: string;
+  started_at: string | null;
+  finished_at: string | null;
+  latency_ms: number | null;
+  token_input: number | null;
+  token_output: number | null;
+  estimated_cost: number | null;
+  error_message: string;
+  fallback_used: boolean;
+};
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+/** Poll until generation finishes. HTTP returns immediately (queued) to avoid Gateway Time-out. */
+export async function waitForPipelineRun(
+  projectId: string,
+  runId: string,
+  opts?: {
+    intervalMs?: number;
+    maxAttempts?: number;
+    onTick?: (run: PipelineRun) => void;
+  }
+): Promise<PipelineRun> {
+  const intervalMs = opts?.intervalMs ?? 3000;
+  // ~20 minutes — full scenario JSON can take a long time on the worker.
+  const maxAttempts = opts?.maxAttempts ?? 400;
+  let consecutiveTransportErrors = 0;
+
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const run = await api<PipelineRun>(`/projects/${projectId}/pipeline/runs/${runId}`);
+      consecutiveTransportErrors = 0;
+      opts?.onTick?.(run);
+      if (run.status === "succeeded") return run;
+      if (run.status === "failed" || run.status === "cancelled") {
+        throw new ApiError(
+          500,
+          run.error_message || `Генерация завершилась со статусом ${run.status}`
+        );
+      }
+    } catch (e) {
+      if (e instanceof ApiError && (e.status === 502 || e.status === 503 || e.status === 504)) {
+        consecutiveTransportErrors += 1;
+        if (consecutiveTransportErrors > 8) throw e;
+      } else {
+        throw e;
+      }
+    }
+    await sleep(intervalMs);
+  }
+  throw new ApiError(
+    504,
+    "Генерация ещё выполняется в фоне. Подождите 1–2 минуты и обновите страницу — результат появится, когда модель закончит."
+  );
+}
+
 export type Project = {
   id: string;
   title: string;

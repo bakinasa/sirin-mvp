@@ -11,7 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.enums import ChatMode, StepType
 from app.models import Artifact, Brief, PipelineStep, Project, ProjectSource, StageChatSession
-from app.services.document import document_outline, extract_expert_qa, find_item_with_neighbors, section_summaries
+from app.services.document import (
+    compact_profession_map_for_scenario,
+    document_outline,
+    extract_expert_qa,
+    find_item_with_neighbors,
+    section_summaries,
+)
 
 from app.services.token_budget import should_truncate_block
 
@@ -147,13 +153,14 @@ async def build_context_bundle(
         pm = await _latest_artifact(db, project_id, StepType.PROFESSION_MAP.value)
         if pm:
             map_content = pm.content if isinstance(pm.content, dict) else {}
+            compact_map = compact_profession_map_for_scenario(map_content)
             blocks.append(
                 {
                     "id": "profession_map",
                     "kind": "approved_artifact",
                     "title": "Сюжет и точки оценки (текущий документ шага 2)",
                     "version": pm.version,
-                    "content": map_content,
+                    "content": compact_map,
                 }
             )
             blocks.append(expert_questions_block(map_content))

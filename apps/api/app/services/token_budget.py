@@ -8,9 +8,11 @@ CHARS_PER_TOKEN = 2.4
 GROQ_REQUEST_TOKEN_BUDGET = 11000
 RESERVE_TOKENS = 512
 MIN_OUTPUT_TOKENS = 2048
-# Soft ceiling for long JSON docs (scenario with 4–10 scenes). Uncapped
-# context_window − prompt can be 100k+ and makes providers hang / 504.
-PIPELINE_OUTPUT_CAP = 16384
+# Enough for multi-scene scenario JSON (training + diagnostic frames). Higher than
+# the old 8192 hard cap; still bounded so providers don't hang forever.
+PIPELINE_OUTPUT_CAP = 32768
+# LLM HTTP read timeout for story/scenario (worker runs this, not the API request).
+PIPELINE_GENERATE_TIMEOUT_SECONDS = 900
 
 # Context blocks passed to the LLM in full — never truncated in render_context_as_text.
 FULL_CONTEXT_BLOCK_IDS = frozenset(

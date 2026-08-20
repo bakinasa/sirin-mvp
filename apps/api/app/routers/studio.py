@@ -40,6 +40,7 @@ from app.services.stages import (
     patch_item,
     restore_version,
     save_version,
+    delete_item,
     set_item_decision,
 )
 
@@ -80,6 +81,7 @@ async def generate_profession_map(
 ):
     body = body or GenerateStageIn()
     try:
+        # Return QUEUED immediately; docker worker runs the LLM (avoids Gateway Time-out).
         return await create_pipeline_run(
             db,
             project_id=project_id,
@@ -88,6 +90,7 @@ async def generate_profession_map(
             operator_prompt=body.operator_prompt,
             primary_model_id=body.primary_model_id,
             fallback_model_id=body.fallback_model_id,
+            wait=False,
         )
     except Exception as exc:  # noqa: BLE001
         raise _http(exc) from exc
@@ -170,9 +173,8 @@ async def reject_map_item(
     user: User = Depends(get_current_user),
 ):
     try:
-        art = await set_item_decision(
-            db, project_id, StepType.PROFESSION_MAP.value, item_id, ItemStatus.REJECTED.value
-        )
+        # "Отклонить" в UI означает удалить карточку из документа.
+        art = await delete_item(db, project_id, StepType.PROFESSION_MAP.value, item_id)
         return _normalize_artifact_content(art, StepType.PROFESSION_MAP.value)
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
@@ -233,6 +235,7 @@ async def generate_scenario(
             operator_prompt=body.operator_prompt,
             primary_model_id=body.primary_model_id,
             fallback_model_id=body.fallback_model_id,
+            wait=False,
         )
     except Exception as exc:  # noqa: BLE001
         raise _http(exc) from exc

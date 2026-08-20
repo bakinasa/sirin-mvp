@@ -264,7 +264,7 @@ def append_section_items(
 
 _SECTION_ITEM_DEFAULTS: dict[str, dict[str, Any]] = {
     "work_storylines": {"story_steps": [], "attention_focus": ""},
-    "assessment_points": {"visual_cues": [], "error_observation": "", "correct_observation": ""},
+    "assessment_points": {"errors": []},
     "expert_questions": {"why_needed": "", "answer": ""},
     "training_scenes": {
         "actors": "",
@@ -338,6 +338,68 @@ def _section_item_titles(content: dict[str, Any], section_id: str) -> list[str]:
                 if title:
                     titles.append(title)
     return titles
+
+
+def compact_profession_map_for_scenario(content: dict[str, Any]) -> dict[str, Any]:
+    """Shrink plot JSON for scenario generation — keep titles/errors, drop noise."""
+    sections_out: list[dict[str, Any]] = []
+    for section in content.get("sections") or []:
+        if not isinstance(section, dict):
+            continue
+        sid = section.get("id")
+        items_in = section.get("items") or []
+        items_out: list[dict[str, Any]] = []
+        for it in items_in:
+            if not isinstance(it, dict):
+                continue
+            if sid == "work_storylines":
+                steps = it.get("story_steps") or []
+                if isinstance(steps, list) and len(steps) > 8:
+                    steps = steps[:8]
+                items_out.append(
+                    {
+                        "title": it.get("title") or "",
+                        "description": str(it.get("description") or "")[:400],
+                        "story_steps": steps,
+                        "attention_focus": str(it.get("attention_focus") or "")[:240],
+                    }
+                )
+            elif sid == "assessment_points":
+                errors = it.get("errors") or []
+                if isinstance(errors, list) and len(errors) > 6:
+                    errors = errors[:6]
+                slim_errors = []
+                for err in errors:
+                    if not isinstance(err, dict):
+                        continue
+                    cues = err.get("visual_cues") or []
+                    if isinstance(cues, list) and len(cues) > 3:
+                        cues = cues[:3]
+                    slim_errors.append(
+                        {
+                            "error": str(err.get("error") or "")[:220],
+                            "correct": str(err.get("correct") or "")[:220],
+                            "visual_cues": cues,
+                        }
+                    )
+                items_out.append(
+                    {
+                        "title": it.get("title") or "",
+                        "description": str(it.get("description") or "")[:240],
+                        "errors": slim_errors,
+                    }
+                )
+            elif sid == "expert_questions":
+                items_out.append(
+                    {
+                        "title": it.get("title") or "",
+                        "why_needed": str(it.get("why_needed") or "")[:200],
+                        "answer": str(it.get("answer") or "")[:500],
+                    }
+                )
+        if sid in ("work_storylines", "assessment_points", "expert_questions"):
+            sections_out.append({"id": sid, "title": section.get("title") or sid, "items": items_out})
+    return {"sections": sections_out}
 
 
 def validate_scenario_parity(

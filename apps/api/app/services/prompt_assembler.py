@@ -213,6 +213,15 @@ async def get_default_operator_prompt(db: AsyncSession, step_type: str) -> str:
     )
 
 
+async def resolve_operator_prompt(
+    db: AsyncSession, step_type: str, operator_prompt: str | None = None
+) -> str:
+    """Operator text only — no context assembly (keeps HTTP generate endpoints fast)."""
+    if operator_prompt is not None and str(operator_prompt).strip():
+        return str(operator_prompt)
+    return await get_default_operator_prompt(db, step_type)
+
+
 async def assemble_prompt(
     db: AsyncSession,
     project_id: UUID,

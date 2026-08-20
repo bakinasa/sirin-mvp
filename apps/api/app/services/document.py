@@ -327,6 +327,63 @@ def extract_expert_qa(content: dict[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
+def _section_item_titles(content: dict[str, Any], section_id: str) -> list[str]:
+    titles: list[str] = []
+    for section in content.get("sections") or []:
+        if not isinstance(section, dict) or section.get("id") != section_id:
+            continue
+        for it in section.get("items") or []:
+            if isinstance(it, dict):
+                title = str(it.get("title") or "").strip()
+                if title:
+                    titles.append(title)
+    return titles
+
+
+def validate_scenario_parity(
+    map_content: dict[str, Any], scenario_content: dict[str, Any]
+) -> list[str]:
+    """Compare work_storylines count/titles vs training/diagnostic scenes."""
+    warnings: list[str] = []
+    storylines = _section_item_titles(map_content, "work_storylines")
+    training = _section_item_titles(scenario_content, "training_scenes")
+    diagnostic = _section_item_titles(scenario_content, "diagnostic_scenes")
+
+    if not storylines:
+        return warnings
+
+    expected = len(storylines)
+    if len(training) != expected:
+        warnings.append(
+            f"Обучающих сцен {len(training)}, а видов работ в сюжете {expected}. "
+            "Ожидается по одной обучающей сцене на каждый вид работ."
+        )
+    if len(diagnostic) != expected:
+        warnings.append(
+            f"Диагностических сцен {len(diagnostic)}, а видов работ в сюжете {expected}. "
+            "Ожидается по одной диагностической сцене на каждый вид работ."
+        )
+
+    story_set = set(storylines)
+    train_set = set(training)
+    diag_set = set(diagnostic)
+    missing_train = story_set - train_set
+    missing_diag = story_set - diag_set
+    if missing_train:
+        warnings.append(f"Пропущены обучающие сцены для видов работ: {', '.join(sorted(missing_train))}")
+    if missing_diag:
+        warnings.append(f"Пропущены диагностические сцены для видов работ: {', '.join(sorted(missing_diag))}")
+
+    extra_train = train_set - story_set
+    extra_diag = diag_set - story_set
+    if extra_train:
+        warnings.append(f"Лишние обучающие сцены (нет в сюжете): {', '.join(sorted(extra_train))}")
+    if extra_diag:
+        warnings.append(f"Лишние диагностические сцены (нет в сюжете): {', '.join(sorted(extra_diag))}")
+
+    return warnings
+
+
 def document_outline(content: dict[str, Any]) -> list[dict[str, Any]]:
     outline = []
     for section in content.get("sections") or []:

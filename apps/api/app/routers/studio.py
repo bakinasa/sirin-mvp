@@ -115,7 +115,10 @@ async def create_map_section_item(
             description=body.description,
             extra=body.extra or None,
         )
-        return SectionItemCreateOut(artifact=artifact, item=item)
+        return SectionItemCreateOut(
+            artifact=_normalize_artifact_content(artifact, StepType.PROFESSION_MAP.value),
+            item=item,
+        )
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
 
@@ -129,9 +132,10 @@ async def patch_map_item(
     user: User = Depends(get_current_user),
 ):
     try:
-        return await patch_item(
+        art = await patch_item(
             db, project_id, StepType.PROFESSION_MAP.value, item_id, body.content
         )
+        return _normalize_artifact_content(art, StepType.PROFESSION_MAP.value)
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
 
@@ -147,9 +151,10 @@ async def accept_map_item(
     user: User = Depends(get_current_user),
 ):
     try:
-        return await set_item_decision(
+        art = await set_item_decision(
             db, project_id, StepType.PROFESSION_MAP.value, item_id, ItemStatus.ACCEPTED.value
         )
+        return _normalize_artifact_content(art, StepType.PROFESSION_MAP.value)
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
 
@@ -165,9 +170,10 @@ async def reject_map_item(
     user: User = Depends(get_current_user),
 ):
     try:
-        return await set_item_decision(
+        art = await set_item_decision(
             db, project_id, StepType.PROFESSION_MAP.value, item_id, ItemStatus.REJECTED.value
         )
+        return _normalize_artifact_content(art, StepType.PROFESSION_MAP.value)
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
 
@@ -182,7 +188,10 @@ async def freeze_map(
     art = await get_current_artifact(db, project_id, StepType.PROFESSION_MAP.value)
     if art is None:
         raise HTTPException(404, "Нет карты профессии")
-    return await freeze_artifact(db, art, (body.change_summary if body else "") or "Frozen")
+    return _normalize_artifact_content(
+        await freeze_artifact(db, art, (body.change_summary if body else "") or "Frozen"),
+        StepType.PROFESSION_MAP.value,
+    )
 
 
 @router.post("/projects/{project_id}/profession-map/new-edition")
@@ -251,7 +260,10 @@ async def create_scenario_section_item(
             description=body.description,
             extra=body.extra or None,
         )
-        return SectionItemCreateOut(artifact=artifact, item=item)
+        return SectionItemCreateOut(
+            artifact=_normalize_artifact_content(artifact, StepType.SCENARIO_PLAN.value),
+            item=item,
+        )
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
 
@@ -265,9 +277,10 @@ async def patch_scenario_item(
     user: User = Depends(get_current_user),
 ):
     try:
-        return await patch_item(
+        art = await patch_item(
             db, project_id, StepType.SCENARIO_PLAN.value, item_id, body.content
         )
+        return _normalize_artifact_content(art, StepType.SCENARIO_PLAN.value)
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
 
@@ -282,7 +295,10 @@ async def freeze_scenario(
     art = await get_current_artifact(db, project_id, StepType.SCENARIO_PLAN.value)
     if art is None:
         raise HTTPException(404, "Нет сценария")
-    return await freeze_artifact(db, art, (body.change_summary if body else "") or "Frozen")
+    return _normalize_artifact_content(
+        await freeze_artifact(db, art, (body.change_summary if body else "") or "Frozen"),
+        StepType.SCENARIO_PLAN.value,
+    )
 
 
 @router.post("/projects/{project_id}/stages/{stage}/chat", response_model=ChatResponse)
@@ -361,7 +377,8 @@ async def apply_patch_route(
     if patch is None:
         raise HTTPException(404, "Patch not found")
     try:
-        return await apply_patch(db, patch, user.id)
+        art = await apply_patch(db, patch, user.id)
+        return _normalize_artifact_content(art, patch.stage_type)
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
 
@@ -432,7 +449,10 @@ async def freeze_route(
     artifact = await db.get(Artifact, artifact_id)
     if artifact is None:
         raise HTTPException(404, "Artifact not found")
-    return await freeze_artifact(db, artifact, (body.change_summary if body else "") or "Frozen")
+    return _normalize_artifact_content(
+        await freeze_artifact(db, artifact, (body.change_summary if body else "") or "Frozen"),
+        artifact.step_type,
+    )
 
 
 @router.post("/artifacts/{artifact_id}/save-version", response_model=ArtifactOut)
@@ -446,7 +466,8 @@ async def save_version_route(
     if artifact is None:
         raise HTTPException(404, "Artifact not found")
     try:
-        return await save_version(db, artifact, body.change_summary if body else "")
+        saved = await save_version(db, artifact, body.change_summary if body else "")
+        return _normalize_artifact_content(saved, artifact.step_type)
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc
 
@@ -463,6 +484,7 @@ async def restore_route(
     if current is None or source is None:
         raise HTTPException(404, "Artifact not found")
     try:
-        return await restore_version(db, current, source)
+        restored = await restore_version(db, current, source)
+        return _normalize_artifact_content(restored, current.step_type)
     except StageEditError as exc:
         raise HTTPException(400, exc.message) from exc

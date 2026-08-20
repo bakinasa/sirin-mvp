@@ -44,6 +44,12 @@ async def get_current_artifact(
     return result.scalar_one_or_none()
 
 
+def _normalize_and_store(artifact: Artifact, content: dict, step_type: str) -> dict:
+    normalized = ensure_ids(content, step_type)
+    artifact.content = normalized
+    return normalized
+
+
 async def add_section_item(
     db: AsyncSession,
     project_id: UUID,
@@ -81,12 +87,12 @@ async def add_section_item(
     if not created_ids:
         raise StageEditError(f"Не удалось добавить пункт в раздел {section_id}")
 
-    artifact.content = content
+    _normalize_and_store(artifact, content, step_type)
     artifact.status = ArtifactStatus.EDITED.value
     await db.flush()
     await db.refresh(artifact)
 
-    saved = find_item(content, created_ids[0])
+    saved = find_item(artifact.content if isinstance(artifact.content, dict) else {}, created_ids[0])
     if saved is None:
         raise StageEditError("Пункт создан, но не найден в документе")
     return artifact, saved
@@ -107,7 +113,7 @@ async def patch_item(
     item.update(new_item)
     item["id"] = item_id
     item["status"] = ItemStatus.EDITED.value
-    artifact.content = content
+    _normalize_and_store(artifact, content, step_type)
     artifact.status = ArtifactStatus.EDITED.value
     await db.flush()
     await db.refresh(artifact)
@@ -121,7 +127,7 @@ async def set_item_decision(
     content = copy.deepcopy(artifact.content) if isinstance(artifact.content, dict) else {}
     if not set_item_status(content, item_id, status):
         raise StageEditError(f"Элемент {item_id} не найден")
-    artifact.content = content
+    _normalize_and_store(artifact, content, step_type)
     artifact.status = ArtifactStatus.EDITED.value
     await db.flush()
     await db.refresh(artifact)

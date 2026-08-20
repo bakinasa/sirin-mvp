@@ -145,26 +145,34 @@ SYSTEM_TEMPLATES = [
     {
         "step_type": "profession_map",
         "role_name": "pre_scenario_analyst",
-        "version": "5",
+        "version": "6",
         "content": (
             "Ты формируешь предсценарный сюжет диагностического VR/360-модуля.\n"
             "Вход: brief проекта, выжимки файлов, заметки, принятые решения.\n\n"
-            "Верни только три секции: work_storylines, assessment_points, expert_questions. "
+            "Документ содержит три РАЗДЕЛА (sections): work_storylines, assessment_points, expert_questions. "
+            "«Три раздела» — это типы секций, а НЕ лимит «по три пункта». "
+            "Количество items в каждом разделе определяется данными проекта, без искусственного ограничения тремя.\n"
             "Не добавляй why_it_matters, frames, evaluated_skills, work_variants, preliminary_storylines.\n\n"
             "Правила:\n"
             "1. Используй только данные проекта. Не выдумывай факты.\n"
             "2. Если данных мало — меньше карточек и больше вопросов в expert_questions.\n"
-            "3. Не пиши markdown и пояснения. Верни только JSON.\n\n"
+            "3. Не пиши markdown и пояснения. Верни только JSON.\n"
+            "4. Не своди результат к «типовым трём сценариям» — извлекай все виды работ из материалов.\n\n"
             "Секции:\n"
             "- work_storylines «Варианты работ и сюжет»: вид работ + укрупнённый сюжет. "
-            "Предложи столько вариантов, сколько подтверждается данными проекта — не менее одного, без верхнего ограничения. "
+            "Извлеки ВСЕ различимые виды работ из brief и выжимок (СОП, регламенты, инструкции, чек-листы). "
+            "Если в материалах 5–10 процедур — создай 5–10 карточек. Не менее одного, без верхнего ограничения. "
             "Поля: title, description, story_steps[] (шаги), attention_focus (строка или короткий список — фокус внимания в кадре).\n"
-            "- assessment_points «Навыки и точки оценки»: одна карточка = один вид работ. "
-            "title — название вида работ (совпадает с work_storylines), description — краткое описание контекста. "
-            "errors[] — список конкретных наблюдаемых ошибок, не менее 3 на карточку: "
+            "- assessment_points «Навыки и точки оценки»: ровно одна карточка на каждый вид работ из work_storylines "
+            "(title совпадает). description — краткий контекст. "
+            "errors[] — все типичные наблюдаемые ошибки для этого вида работ из материалов, не менее 3 на карточку, "
+            "без верхнего лимита: "
             "{error: что именно сделано неправильно, correct: как надо делать, visual_cues[]: как это видно в кадре}. "
             "Нет отдельных error_observation/correct_observation.\n"
-            "- expert_questions: title, description, why_needed, answer (пустая строка, пока эксперт не ответил).\n\n"
+            "- expert_questions: 5–12 конкретных вопросов экспертам (больше — если много пробелов в данных). "
+            "title — формулировка вопроса; description — контекст и что уже известно из материалов; "
+            "why_needed — зачем ответ нужен для сценария и оценки (конкретно, не общие слова); "
+            "answer — пустая строка. Приоритет: пробелы в данных, спорные нормы, граничные случаи, неоднозначности в СОП.\n\n"
             "Структура ответа:\n"
             "{\n"
             "  \"sections\": [\n"
@@ -188,7 +196,7 @@ SYSTEM_TEMPLATES = [
     {
         "step_type": "scenario_plan",
         "role_name": "scenario_director",
-        "version": "5",
+        "version": "6",
         "content": (
             "Ты создаёшь сценарий VR/360-модуля: только обучающие и диагностические сцены.\n"
             "Опирайся только на текущий сюжет шага 2 и блок «Вопросы экспертам и ответы». "
@@ -198,7 +206,8 @@ SYSTEM_TEMPLATES = [
             "1. Не выдумывай нормативы, роли и ограничения, которых нет в сюжете или ответах экспертов.\n"
             "2. Обучение и диагностика соответствуют одним этапам работы.\n"
             "3. Ошибки визуально наблюдаемы и воспроизводимы актёрами в 360-видео.\n"
-            "4. Не пиши markdown. Верни только JSON.\n\n"
+            "4. Не пиши markdown. Верни только JSON.\n"
+            "5. Диагностика — это сценарий с намеренно показанными ошибками, а не повтор обучения.\n\n"
             "Обучающая сцена (как «Выход из подъезда»):\n"
             "title — вид работ; actors — текст; location — текст; "
             "frames[] — таблица кадров: shot_no, action, accent; "
@@ -206,21 +215,26 @@ SYSTEM_TEMPLATES = [
             "объясняет зрителю что делать правильно и почему; 2–5 предложений; "
             "regulations[] — список названий документов/СОП/файлов, на которые опирается сцена "
             "(брать из source titles в проекте); props — реквизит (текст или список строк).\n\n"
-            "Диагностическая сцена:\n"
+            "Диагностическая сцена (обязательные правила):\n"
             "title, actors, location; "
-            "frames[]: shot_no, action (описание действия в кадре), violation (пусто если нормальное действие), accent; "
-            "полный сценарий со входа — все кадры как в обучении; "
-            "нарушение заполнено только там, где специально допускается; "
-            "violation_categories[] — категории нарушений сцены (уровень сцены, не кадра): "
-            "{title: название категории, violation: точная формулировка нарушения из таблицы кадров, "
-            "description: подробное объяснение — почему это нарушение, какое правило нарушено, к чему это приводит}; "
+            "frames[]: shot_no, action, violation, accent.\n"
+            "Полный ход работ со входа — те же этапы, что в обучении для этого вида работ.\n"
+            "Часть кадров — норма (violation = \"\"), часть кадров — с ошибкой (violation заполнено).\n"
+            "В кадре с ошибкой: action описывает ЧТО ИМЕННО делается неправильно (видно в кадре); "
+            "violation — краткая формулировка нарушения.\n"
+            "Минимум 3 кадра с непустым violation на каждую диагностическую сцену "
+            "(больше — если в assessment_points/errors[] для этого вида работ ошибок больше).\n"
+            "ЗАПРЕЩЕНО: оставлять violation пустым во всех кадрах и переносить ошибки только в violation_categories.\n"
+            "Ошибки для диагностики бери из assessment_points/errors[] текущего сюжета.\n"
+            "violation_categories[] — по каждой ошибке из таблицы кадров (уровень сцены): "
+            "{title, violation (дословно из кадра), description (какое правило нарушено, последствия)}; "
             "regulations[] — список названий документов/СОП/файлов; props. Аудио не обязательно.\n\n"
             "Пример кадра обучения: {\"shot_no\": 1, \"action\": \"Работник выходит из подъезда, закрывает дверь\", "
             "\"accent\": \"Крупно рука на ручке и положение двери\"}.\n"
-            "Пример кадра диагностики: {\"shot_no\": 1, \"action\": \"Работник выходит из подъезда\", "
+            "Пример кадра диагностики (норма): {\"shot_no\": 1, \"action\": \"Работник подходит к двери и проверяет табличку\", "
             "\"violation\": \"\", \"accent\": \"Общий план\"}.\n"
-            "Пример кадра диагностики с нарушением: {\"shot_no\": 3, \"action\": \"Работник открывает дверь и уходит\", "
-            "\"violation\": \"Дверь оставлена открытой\", \"accent\": \"Открытый проём виден в кадре\"}.\n"
+            "Пример кадра диагностики (ошибка): {\"shot_no\": 3, \"action\": \"Горничная стучит один раз и сразу открывает дверь ключом\", "
+            "\"violation\": \"Недостаточное количество стуков перед входом\", \"accent\": \"Крупно рука на двери\"}.\n"
             "Пример violation_categories: [{\"title\": \"Контроль доступа\", "
             "\"violation\": \"Дверь оставлена открытой\", "
             "\"description\": \"Нарушен п. 3.2 регламента контроля доступа. Открытая дверь позволяет посторонним войти в подъезд. "
@@ -337,13 +351,14 @@ OPERATOR_PRESETS = [
         "is_default": True,
         "content": (
             "Сформируй предсценарный сюжет диагностического модуля — три раздела.\n\n"
-            "1. Варианты работ и сюжет: title, description, шаги story_steps[], фокус внимания attention_focus. "
-            "Предложи столько вариантов, сколько подтверждается данными проекта — не менее одного, без верхнего ограничения.\n"
-            "2. Навыки и точки оценки: одна карточка = один вид работ. "
-            "title — название вида работ, description — контекст. "
-            "errors[] — список конкретных ошибок (не менее 3): {error, correct, visual_cues[]}.\n"
-            "3. Вопросы экспертам: title, description, why_needed, answer (пока пустой).\n\n"
-            "Это не покадровый сценарий. Не выдумывай факты. Если данных мало — фиксируй вопросы экспертам."
+            "Важно: три раздела — это типы секций, а не лимит «по три пункта».\n\n"
+            "1. Варианты работ и сюжет: извлеки ВСЕ виды работ из материалов проекта (без ограничения тремя). "
+            "title, description, story_steps[], attention_focus.\n"
+            "2. Навыки и точки оценки: одна карточка на каждый вид работ (title совпадает). "
+            "errors[] — все типичные ошибки (не менее 3 на карточку): {error, correct, visual_cues[]}.\n"
+            "3. Вопросы экспертам: 5–12 конкретных вопросов с качественным why_needed; "
+            "title, description, why_needed, answer (пока пустой).\n\n"
+            "Не выдумывай факты. Если данных мало — фиксируй вопросы экспертам."
         ),
     },
     {
@@ -354,11 +369,14 @@ OPERATOR_PRESETS = [
             "На основе текущего сюжета шага 2 и ответов экспертам собери только обучающие и диагностические сцены.\n\n"
             "Обучение: title, actors, location, таблица кадров (shot_no, action, accent), "
             "audio_text — голосовая инструкция 2–5 предложений (что делать и почему), "
-            "regulations[] — список названий файлов/СОП, props. Ориентир — сцена вроде «Выход из подъезда».\n"
-            "Диагностика: title, actors, location, кадры (shot_no, action, violation пусто=норма, accent), "
-            "полный сценарий со входа; violation_categories[] — {title, violation, description подробное}; "
-            "regulations[] — список названий файлов/СОП, props. Аудио не обязательно.\n\n"
-            "Не добавляй паспорт, microtexts и съёмочный план. Не требуй сырые файлы. Не выдумывай факты."
+            "regulations[] — список названий файлов/СОП, props.\n"
+            "Диагностика — сценарий с намеренными ошибками для проверки: "
+            "полный ход со входа; кадры (shot_no, action, violation, accent); "
+            "минимум 3 кадра с непустым violation; в кадрах с ошибкой action показывает неправильное действие; "
+            "ошибки из assessment_points/errors[]; "
+            "violation_categories[] — {title, violation (из кадра), description}; "
+            "regulations[], props.\n\n"
+            "Не добавляй паспорт, microtexts и съёмочный план. Не выдумывай факты."
         ),
     },
 ]
@@ -401,7 +419,7 @@ async def seed() -> None:
             else:
                 print(f"Skip catalog sync for {p.name}: no API key")
 
-        # System templates
+        # System templates — upsert by (step_type, version); activate latest seeded version
         for tpl in SYSTEM_TEMPLATES:
             exists = await db.execute(
                 select(PromptTemplate).where(
@@ -409,7 +427,8 @@ async def seed() -> None:
                     PromptTemplate.version == tpl["version"],
                 )
             )
-            if exists.scalar_one_or_none() is None:
+            row = exists.scalar_one_or_none()
+            if row is None:
                 if tpl.get("is_active", True):
                     old = await db.execute(
                         select(PromptTemplate).where(
@@ -417,9 +436,24 @@ async def seed() -> None:
                             PromptTemplate.is_active.is_(True),
                         )
                     )
-                    for row in old.scalars().all():
-                        row.is_active = False
+                    for old_row in old.scalars().all():
+                        old_row.is_active = False
                 db.add(PromptTemplate(**tpl, is_active=True))
+            else:
+                row.role_name = tpl["role_name"]
+                row.content = tpl["content"]
+                if tpl.get("is_active", True):
+                    row.is_active = True
+                    old = await db.execute(
+                        select(PromptTemplate).where(
+                            PromptTemplate.step_type == tpl["step_type"],
+                            PromptTemplate.is_active.is_(True),
+                            PromptTemplate.id != row.id,
+                        )
+                    )
+                    for old_row in old.scalars().all():
+                        old_row.is_active = False
+                print(f"Updated system template {tpl['step_type']} v{tpl['version']}")
 
         # Operator presets: upsert the default prompt per step.
         for preset in OPERATOR_PRESETS:

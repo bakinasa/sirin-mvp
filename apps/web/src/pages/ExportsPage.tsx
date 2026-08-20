@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { api, PipelineStep } from "../lib/api";
 import { PipelineStepper } from "../components/PipelineStepper";
+import { downloadDocx, exportDocx } from "../lib/docxExport";
 
 type ExportJob = {
   id: string;
@@ -11,48 +12,29 @@ type ExportJob = {
   error_message: string;
 };
 
-function downloadDocx(content: unknown, fallbackFilename: string) {
-  const c = content as Record<string, string> | null;
-  if (!c?.docx_base64) return;
-  const binary = atob(c.docx_base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const blob = new Blob([bytes], {
-    type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = c.filename || fallbackFilename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
 export function ExportsPage() {
   const { projectId } = useParams();
   const [steps, setSteps] = useState<PipelineStep[]>([]);
   const [job, setJob] = useState<ExportJob | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     if (!projectId) return;
     api<PipelineStep[]>(`/projects/${projectId}/pipeline`).then(setSteps);
   }, [projectId]);
 
-  async function runDocx() {
-    setBusy(true);
+  async function run(type: "docx_scenario" | "docx_profession_map") {
+    if (!projectId) return;
+    setBusy(type);
     try {
-      const created = await api<ExportJob>(`/projects/${projectId}/exports`, {
-        method: "POST",
-        body: JSON.stringify({ export_type: "docx_scenario" }),
-      });
-      const full = await api<ExportJob>(`/exports/${created.id}`);
+      const full = await exportDocx(
+        projectId,
+        type,
+        type === "docx_scenario" ? "scenario.docx" : "story.docx"
+      );
       setJob(full);
-      if (full.status === "ready") {
-        downloadDocx(full.result_content, "scenario.docx");
-      }
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
@@ -63,15 +45,34 @@ export function ExportsPage() {
       <PipelineStepper projectId={projectId} steps={steps} />
       <div className="mb-6">
         <h1 className="text-3xl font-semibold tracking-tight">Экспорт</h1>
-        <p className="text-sm text-neutral-500">Сценарий в формате Word (.docx).</p>
+        <p className="text-sm text-neutral-500">Сюжет и сценарий в формате Word (.docx).</p>
       </div>
 
-      <div className="mb-6 flex gap-3">
-        <button className="btn-primary" disabled={busy} onClick={runDocx}>
-          {busy ? "Генерация…" : "Скачать сценарий DOCX"}
+      <div className="mb-6 flex flex-wrap gap-3">
+        <button
+          className="btn-primary"
+          disabled={!!busy}
+          onClick={() => void run("docx_scenario")}
+        >
+          {busy === "docx_scenario" ? "Генерация…" : "Скачать сценарий DOCX"}
+        </button>
+        <button
+          className="btn-ghost"
+          disabled={!!busy}
+          onClick={() => void run("docx_profession_map")}
+        >
+          {busy === "docx_profession_map" ? "Генерация…" : "Скачать сюжет DOCX"}
         </button>
         {job?.status === "ready" && (
-          <button className="btn-ghost" onClick={() => downloadDocx(job.result_content, "scenario.docx")}>
+          <button
+            className="btn-ghost"
+            onClick={() =>
+              downloadDocx(
+                job.result_content,
+                job.export_type === "docx_profession_map" ? "story.docx" : "scenario.docx"
+              )
+            }
+          >
             Скачать снова
           </button>
         )}

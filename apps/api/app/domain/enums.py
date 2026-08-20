@@ -120,6 +120,7 @@ class ExportType(StrEnum):
     JSON = "json"
     TEXT_BUNDLE = "text_bundle"
     DOCX_SCENARIO = "docx_scenario"
+    DOCX_PROFESSION_MAP = "docx_profession_map"
 
 
 class ExportStatus(StrEnum):

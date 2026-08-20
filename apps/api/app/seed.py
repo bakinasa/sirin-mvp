@@ -12,6 +12,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.models import OperatorPromptPreset, PromptTemplate, User
+from app.operator_preset_defaults import OPERATOR_PRESETS
 from app.security.auth import hash_password
 from app.services.catalog import ensure_provider_presets, provider_has_key, sync_provider_models
 
@@ -293,109 +294,6 @@ SYSTEM_TEMPLATES = [
     },
 ]
 
-OPERATOR_PRESETS = [
-    {
-        "step_type": "draft_tz",
-        "title": "Первичное ТЗ",
-        "is_default": True,
-        "content": (
-            "Сформируй первичное техническое задание для 360°-тренажёрного модуля по материалам проекта.\n"
-            "Сделай акцент на целях обучения, последовательности действий, типичных ошибках, критических рисках "
-            "и наблюдаемых действиях сотрудника.\n"
-            "Если не хватает данных по профессии или условиям работы, явно перечисли вопросы на уточнение."
-        ),
-    },
-    {
-        "step_type": "expert_synthesis",
-        "title": "Сведение экспертного фидбека",
-        "is_default": True,
-        "content": (
-            "Проанализируй замечания экспертов и собери итоговую согласованную версию ТЗ.\n"
-            "Покажи:\n"
-            "- что совпадает у экспертов;\n"
-            "- где есть расхождения;\n"
-            "- какие требования являются критичными;\n"
-            "- какие элементы нужно обязательно отразить в финальном ТЗ.\n"
-            "Не скрывай конфликты мнений."
-        ),
-    },
-    {
-        "step_type": "final_tz",
-        "title": "Итоговое ТЗ",
-        "is_default": True,
-        "content": (
-            "Собери итоговое ТЗ на основе утверждённых артефактов и синтеза экспертов.\n"
-            "Структурируй документ по разделам. Укажи пробелы явно."
-        ),
-    },
-    {
-        "step_type": "scene_breakdown",
-        "title": "Разбиение на сцены",
-        "is_default": True,
-        "content": (
-            "Разбей утверждённое ТЗ на последовательные шаги, сцены и кадры для 360°-производства.\n"
-            "Для каждой сцены укажи цель, действия, точку внимания, потенциальный риск, примерный тайминг "
-            "и рекомендации по способу производства."
-        ),
-    },
-    {
-        "step_type": "production_planning",
-        "title": "Production planning",
-        "is_default": True,
-        "content": (
-            "Для каждой сцены определи способ производства: снять реально / сгенерировать ИИ / смешанный.\n"
-            "Кратко обоснуй выбор."
-        ),
-    },
-    {
-        "step_type": "storyboard",
-        "title": "Раскадровка",
-        "is_default": True,
-        "content": (
-            "Сформируй раскадровку по утверждённому разбиению сцен.\n"
-            "Для каждого кадра: описание, закадр, интерактив (если есть)."
-        ),
-    },
-    {
-        "step_type": "profession_map",
-        "title": "Сюжет и точки оценки",
-        "is_default": True,
-        "content": (
-            "Сформируй предсценарный сюжет диагностического модуля — три раздела.\n\n"
-            "Важно: три раздела — это типы секций, а не лимит «по три пункта».\n\n"
-            "1. Варианты работ и сюжет: извлеки ВСЕ виды работ из материалов проекта (без ограничения тремя). "
-            "title, description, story_steps[], attention_focus.\n"
-            "2. Навыки и точки оценки: одна карточка на каждый вид работ (title совпадает). "
-            "errors[] — все типичные ошибки (не менее 3 на карточку): {error, correct, visual_cues[]}.\n"
-            "3. Вопросы экспертам: только то, чего нет в документах и нельзя додумать самому — "
-            "противоречия, пропуски критичных критериев, спорные обязательные шаги, граничные случаи. "
-            "Не спрашивай очевидное и то, что уже следует из СОП/brief. Лучше 2–4 сильных вопроса, чем список общих. "
-            "В description укажи неясность со ссылкой на источник. title, description, why_needed, answer (пустой).\n\n"
-            "Не выдумывай факты. Не заполняй expert_questions ради количества."
-        ),
-    },
-    {
-        "step_type": "scenario_plan",
-        "title": "Сценарий: обучение и диагностика",
-        "is_default": True,
-        "content": (
-            "На основе текущего сюжета шага 2 и ответов экспертам собери только обучающие и диагностические сцены.\n\n"
-            "Соответствие сюжету: для каждого вида работ из work_storylines — ровно одна обучающая и одна "
-            "диагностическая сцена с тем же title. Не пропускай виды работ.\n"
-            "Пиши компактно: 4–6 кадров в обучении, 5–7 в диагностике, минимум 2 violation-кадра.\n\n"
-            "Обучение: title, actors, location, таблица кадров (shot_no, action, accent), "
-            "audio_text — голосовая инструкция 2–5 предложений (что делать и почему), "
-            "regulations[] — список названий файлов/СОП, props.\n"
-            "Диагностика — сценарий с намеренными ошибками для проверки: "
-            "полный ход со входа; кадры (shot_no, action, violation, accent); "
-            "минимум 2 кадра с непустым violation; в кадрах с ошибкой action показывает неправильное действие; "
-            "ошибки из assessment_points/errors[]; "
-            "violation_categories[] — {title, violation (из кадра), description}; "
-            "regulations[], props.\n\n"
-            "Не добавляй паспорт, microtexts и съёмочный план. Не выдумывай факты."
-        ),
-    },
-]
 
 
 async def seed() -> None:
@@ -471,7 +369,8 @@ async def seed() -> None:
                         old_row.is_active = False
                 print(f"Updated system template {tpl['step_type']} v{tpl['version']}")
 
-        # Operator presets: upsert the default prompt per step.
+        # Operator presets: create default if missing. Do not overwrite content —
+        # operators edit these in the pipeline and seed must not clobber them.
         for preset in OPERATOR_PRESETS:
             exists = await db.execute(
                 select(OperatorPromptPreset).where(
@@ -482,9 +381,6 @@ async def seed() -> None:
             row = exists.scalars().first()
             if row is None:
                 db.add(OperatorPromptPreset(**preset))
-            else:
-                row.title = preset["title"]
-                row.content = preset["content"]
 
         # Optional: load YAML overlays from /prompts
         prompts_dir = Path(settings.prompts_dir)

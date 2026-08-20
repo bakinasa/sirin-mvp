@@ -234,6 +234,10 @@ class OperatorPresetCreate(BaseModel):
     is_default: bool = False
 
 
+class OperatorPresetDefaultUpdate(BaseModel):
+    content: str
+
+
 class ProviderOut(BaseModel):
     id: UUID
     name: str

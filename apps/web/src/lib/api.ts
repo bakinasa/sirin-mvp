@@ -279,10 +279,10 @@ export const STATUS_LABELS: Record<string, string> = {
   approved: "Approved",
   locked: "Locked",
   outdated: "Outdated",
-  proposed: "Proposed",
-  accepted: "Accepted",
-  rejected: "Rejected",
-  edited: "Edited",
+  proposed: "Предложено",
+  accepted: "Принято",
+  rejected: "Отклонено",
+  edited: "Изменено",
 };
 
 export function statusColor(status: string): string {
@@ -294,6 +294,8 @@ export function statusColor(status: string): string {
     case "ai_generated":
     case "under_review":
       return "bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-200";
+    case "edited":
+      return "bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200";
     case "needs_revision":
     case "outdated":
       return "bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100";

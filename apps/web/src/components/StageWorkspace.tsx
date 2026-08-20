@@ -55,6 +55,7 @@ export function StageWorkspace({
   const [comments, setComments] = useState<CommentThread[]>([]);
   const saveTimer = useRef<number | null>(null);
   const pendingSaveItemRef = useRef<DocItem | null>(null);
+  const saveInFlightRef = useRef<Promise<void>>(Promise.resolve());
   const autoSaveInFlight = useRef(false);
   const artifactRef = useRef<Artifact | null>(null);
   artifactRef.current = artifact;
@@ -213,9 +214,10 @@ export function StageWorkspace({
   function handleItemChange(next: DocItem) {
     const prev = artifactRef.current;
     if (!prev) return;
+    const toStore: DocItem = { ...next, status: "edited" };
     const patched = patchItemInDoc(
       prev.content,
-      next,
+      toStore,
       currentSection?.id || sectionId
     );
     if (!patched) {
@@ -227,66 +229,68 @@ export function StageWorkspace({
     // Keep ref in sync before React re-renders so rapid keystrokes don't use a stale doc.
     artifactRef.current = updated;
     setArtifact(updated);
-    scheduleItemSave(next);
+    scheduleItemSave(toStore);
+  }
+
+  function itemPatchPath(itemId: string) {
+    return stageType === "profession_map"
+      ? `/projects/${projectId}/profession-map/items/${itemId}`
+      : `/projects/${projectId}/scenario/items/${itemId}`;
+  }
+
+  function findLocalItem(itemId: string): DocItem | null {
+    const sections = asDoc(artifactRef.current?.content).sections || [];
+    for (const section of sections) {
+      const found = (section.items || []).find((it) => it.id === itemId);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function persistItem(item: DocItem): Promise<void> {
+    const run = saveInFlightRef.current.catch(() => undefined).then(async () => {
+      await api<Artifact>(itemPatchPath(item.id), {
+        method: "PATCH",
+        body: JSON.stringify({ content: item }),
+      });
+    });
+    saveInFlightRef.current = run.catch(() => undefined);
+    return run;
   }
 
   function scheduleItemSave(item: DocItem) {
     pendingSaveItemRef.current = item;
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(async () => {
-      const toSave = pendingSaveItemRef.current;
+    saveTimer.current = window.setTimeout(() => {
+      const id = pendingSaveItemRef.current?.id;
       saveTimer.current = null;
-      if (!toSave) return;
       pendingSaveItemRef.current = null;
-      try {
-        const path =
-          stageType === "profession_map"
-            ? `/projects/${projectId}/profession-map/items/${toSave.id}`
-            : `/projects/${projectId}/scenario/items/${toSave.id}`;
-        // Persist only. Do NOT replace local document with PATCH response —
-        // that overwrites newer keystrokes (especially nested tables like errors[] / frames[]).
-        await api<Artifact>(path, {
-          method: "PATCH",
-          body: JSON.stringify({ content: toSave }),
-        });
-      } catch (e) {
-        setError(String(e));
-      }
+      const toSave = (id && findLocalItem(id)) || item;
+      if (!toSave) return;
+      persistItem(toSave).catch((e) => setError(String(e)));
     }, 700);
   }
 
-  async function flushScheduledItemSave() {
-    if (!pendingSaveItemRef.current) {
-      if (saveTimer.current) {
-        window.clearTimeout(saveTimer.current);
-        saveTimer.current = null;
-      }
-      return;
-    }
-    const toSave = pendingSaveItemRef.current;
+  async function flushScheduledItemSave(itemId?: string) {
     if (saveTimer.current) {
       window.clearTimeout(saveTimer.current);
       saveTimer.current = null;
     }
+    const pending = pendingSaveItemRef.current;
     pendingSaveItemRef.current = null;
-
-    try {
-      const path =
-        stageType === "profession_map"
-          ? `/projects/${projectId}/profession-map/items/${toSave.id}`
-          : `/projects/${projectId}/scenario/items/${toSave.id}`;
-      await api<Artifact>(path, {
-        method: "PATCH",
-        body: JSON.stringify({ content: toSave }),
-      });
-    } catch (e) {
-      setError(String(e));
+    const id = itemId || pending?.id;
+    const toSave = (id && findLocalItem(id)) || pending;
+    if (toSave) {
+      await persistItem(toSave);
     }
+    await saveInFlightRef.current;
   }
 
   async function decide(itemId: string, kind: "accept" | "reject") {
     try {
-      await flushScheduledItemSave();
+      // Always persist the latest local card first. Otherwise Accept races an
+      // in-flight PATCH and the server response overwrites typed errors[] / status.
+      await flushScheduledItemSave(itemId);
       const updated = await api<Artifact>(
         `/projects/${projectId}/profession-map/items/${itemId}/${kind}`,
         { method: "POST" }
